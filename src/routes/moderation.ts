@@ -21,26 +21,57 @@ const muteSchema = z.object({
 
 router.get('/:roomId/blocked-messages', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
   const { roomId } = req.params;
-  const { page = '1', page_size = '50' } = req.query;
+  const { page = '1', page_size = '50', handled } = req.query;
 
   const pageNum = Math.max(1, Number(page));
   const pageSize = Math.min(200, Math.max(1, Number(page_size)));
   const offset = (pageNum - 1) * pageSize;
 
+  let where = 'cm.room_id = ? AND cm.blocked = 1';
+  const params: any[] = [roomId];
+
+  if (handled === 'true') {
+    where += ' AND cm.handled = 1';
+  } else if (handled === 'false') {
+    where += ' AND cm.handled = 0';
+  }
+
   const totalRow = db.prepare(
-    'SELECT COUNT(*) as count FROM chat_messages WHERE room_id = ? AND blocked = 1'
-  ).get(roomId) as { count: number };
+    `SELECT COUNT(*) as count FROM chat_messages cm WHERE ${where}`
+  ).get(...params) as { count: number };
 
   const rows = db.prepare(`
-    SELECT cm.*, u.username, u.nickname, u.avatar
+    SELECT 
+      cm.id,
+      cm.room_id,
+      cm.user_id,
+      cm.user_nickname,
+      cm.content as masked_content,
+      cm.original_content,
+      cm.blocked_reason,
+      cm.msg_type,
+      cm.blocked,
+      cm.handled,
+      cm.handled_at,
+      cm.handled_by,
+      cm.created_at,
+      u.username,
+      u.nickname,
+      u.avatar,
+      hu.nickname as handled_by_nickname
     FROM chat_messages cm
     LEFT JOIN users u ON cm.user_id = u.id
-    WHERE cm.room_id = ? AND cm.blocked = 1
+    LEFT JOIN users hu ON cm.handled_by = hu.id
+    WHERE ${where}
     ORDER BY cm.created_at DESC
     LIMIT ? OFFSET ?
-  `).all(roomId, pageSize, offset);
+  `).all(...params, pageSize, offset);
 
   const list = Array.isArray(rows) ? rows : [];
+
+  const unhandledCountRow = db.prepare(
+    'SELECT COUNT(*) as count FROM chat_messages WHERE room_id = ? AND blocked = 1 AND handled = 0'
+  ).get(roomId) as { count: number };
 
   success(res, {
     list,
@@ -48,6 +79,7 @@ router.get('/:roomId/blocked-messages', authMiddleware, teacherMiddleware, (req:
     page: pageNum,
     page_size: pageSize,
     empty: totalRow.count === 0,
+    unhandled_count: unhandledCountRow.count,
   }, totalRow.count === 0 ? '暂无拦截消息' : 'success');
 });
 
@@ -222,6 +254,110 @@ router.get('/:roomId/mute-records', authMiddleware, teacherMiddleware, (req: Req
     page_size: pageSize,
     empty: totalRow.count === 0,
   });
+});
+
+router.post('/:roomId/blocked-messages/:msgId/handle', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { roomId, msgId } = req.params;
+  const { userId: operatorId } = (req as any).user;
+  const { action = 'mark_handled' } = req.body;
+
+  const msg = db.prepare('SELECT * FROM chat_messages WHERE id = ? AND room_id = ? AND blocked = 1')
+    .get(msgId, roomId);
+  if (!msg) {
+    return error(res, '拦截消息不存在', 404);
+  }
+
+  const now = Date.now();
+  db.prepare('UPDATE chat_messages SET handled = 1, handled_at = ?, handled_by = ? WHERE id = ?')
+    .run(now, operatorId, msgId);
+
+  const updated = db.prepare(`
+    SELECT cm.*, u.username, u.nickname, u.avatar,
+      hu.nickname as handled_by_nickname
+    FROM chat_messages cm
+    LEFT JOIN users u ON cm.user_id = u.id
+    LEFT JOIN users hu ON cm.handled_by = hu.id
+    WHERE cm.id = ?
+  `).get(msgId);
+
+  success(res, { message: updated, action }, '处理成功');
+});
+
+router.post('/:roomId/blocked-messages/:msgId/mute', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { roomId, msgId } = req.params;
+  const { userId: operatorId, role } = (req as any).user;
+  const { duration_minutes = 30, reason } = req.body;
+
+  const msg = db.prepare('SELECT * FROM chat_messages WHERE id = ? AND room_id = ? AND blocked = 1')
+    .get(msgId, roomId);
+  if (!msg) {
+    return error(res, '拦截消息不存在', 404);
+  }
+
+  const msgData = msg as any;
+  const userId = msgData.user_id;
+
+  const targetUser = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!targetUser) {
+    return error(res, '用户不存在', 404);
+  }
+
+  if ((targetUser as any).role === 'teacher' || (targetUser as any).role === 'admin') {
+    if (role !== 'admin') {
+      return error(res, '无权限禁言讲师或管理员', 403);
+    }
+  }
+
+  const safeDuration = Math.min(1440, Math.max(1, Number(duration_minutes) || 30));
+  const muteInfo = muteUser(
+    roomId,
+    userId,
+    safeDuration,
+    reason || msgData.blocked_reason || '违规发言',
+    operatorId
+  );
+
+  const now = Date.now();
+  db.prepare('UPDATE chat_messages SET handled = 1, handled_at = ?, handled_by = ? WHERE id = ?')
+    .run(now, operatorId, msgId);
+
+  const io = (req as any).io;
+  if (io) {
+    io.to(roomId).emit('user_muted', {
+      user_id: userId,
+      mute_until: muteInfo.mute_until,
+      reason: muteInfo.reason,
+      operator_id: operatorId,
+    });
+  }
+
+  success(res, {
+    mute_info: muteInfo,
+    message_handled: true,
+    user: {
+      id: userId,
+      username: (targetUser as any).username,
+      nickname: (targetUser as any).nickname,
+    },
+  }, '禁言成功，消息已标记处理');
+});
+
+router.post('/:roomId/blocked-messages/batch-handle', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { roomId } = req.params;
+  const { userId: operatorId } = (req as any).user;
+  const { message_ids } = req.body;
+
+  if (!Array.isArray(message_ids) || message_ids.length === 0) {
+    return error(res, '请提供消息ID列表', 400);
+  }
+
+  const now = Date.now();
+  const placeholders = message_ids.map(() => '?').join(',');
+  db.prepare(`UPDATE chat_messages SET handled = 1, handled_at = ?, handled_by = ? 
+    WHERE room_id = ? AND blocked = 1 AND id IN (${placeholders})`)
+    .run(now, operatorId, roomId, ...message_ids);
+
+  success(res, { handled_count: message_ids.length }, '批量处理成功');
 });
 
 export default router;

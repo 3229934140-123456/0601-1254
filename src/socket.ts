@@ -13,6 +13,51 @@ import {
 } from './services/roomAccess';
 
 const roomSockets: Map<string, Set<string>> = new Map();
+const socketRooms: Map<string, Set<string>> = new Map();
+
+function hasJoinedRoom(socketId: string, roomId: string): boolean {
+  return socketRooms.get(socketId)?.has(roomId) || false;
+}
+
+function markJoinedRoom(socketId: string, roomId: string): void {
+  if (!socketRooms.has(socketId)) {
+    socketRooms.set(socketId, new Set());
+  }
+  socketRooms.get(socketId)!.add(roomId);
+}
+
+function markLeftRoom(socketId: string, roomId: string): void {
+  if (socketRooms.has(socketId)) {
+    socketRooms.get(socketId)!.delete(roomId);
+  }
+}
+
+function clearSocketRooms(socketId: string): void {
+  const rooms = socketRooms.get(socketId);
+  if (rooms) {
+    for (const roomId of rooms) {
+      if (roomSockets.has(roomId)) {
+        roomSockets.get(roomId)!.delete(socketId);
+      }
+    }
+  }
+  socketRooms.delete(socketId);
+}
+
+function verifyRoomAccess(
+  socket: Socket,
+  roomId: string,
+  user: any
+): { allowed: boolean; reason?: string; code?: number } {
+  if (!hasJoinedRoom(socket.id, roomId)) {
+    return { allowed: false, reason: '您尚未进入直播间，请先进入后再操作', code: 403 };
+  }
+  const result = checkRoomAccess(roomId, user.userId, user.role);
+  if (!result.allowed) {
+    return { allowed: false, reason: result.reason, code: result.code };
+  }
+  return { allowed: true };
+}
 
 export function setupSocketIO(io: Server) {
   io.use((socket: Socket, next) => {
@@ -43,6 +88,7 @@ export function setupSocketIO(io: Server) {
       }
 
       socket.join(roomId);
+      markJoinedRoom(socket.id, roomId);
 
       if (!roomSockets.has(roomId)) {
         roomSockets.set(roomId, new Set());
@@ -86,6 +132,16 @@ export function setupSocketIO(io: Server) {
       msg_type?: 'text' | 'emoji';
       is_question?: boolean;
     }) => {
+      const access = verifyRoomAccess(socket, roomId, user);
+      if (!access.allowed) {
+        socket.emit('action_denied', {
+          action: 'send_message',
+          message: access.reason || '无权操作',
+          code: access.code || 403,
+        });
+        return;
+      }
+
       if (!content || content.length > 500) {
         socket.emit('error', { message: '消息内容无效' });
         return;
@@ -110,14 +166,16 @@ export function setupSocketIO(io: Server) {
       const dbUser = db.prepare('SELECT nickname FROM users WHERE id = ?').get(user.userId) as { nickname?: string };
 
       db.prepare(`INSERT INTO chat_messages 
-        (id, room_id, user_id, user_nickname, content, msg_type, is_pinned, is_question, blocked, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`)
+        (id, room_id, user_id, user_nickname, content, original_content, blocked_reason, msg_type, is_pinned, is_question, blocked, handled, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, ?)`)
         .run(
           id,
           roomId,
           user.userId,
           dbUser?.nickname || '匿名用户',
           banned ? maskContent(content) : content,
+          banned ? content : null,
+          banned || null,
           msg_type,
           is_question ? 1 : 0,
           banned ? 1 : 0,
@@ -145,6 +203,16 @@ export function setupSocketIO(io: Server) {
     });
 
     socket.on('pin_message', async ({ roomId, messageId }: { roomId: string; messageId: string }) => {
+      const access = verifyRoomAccess(socket, roomId, user);
+      if (!access.allowed) {
+        socket.emit('action_denied', {
+          action: 'pin_message',
+          message: access.reason || '无权操作',
+          code: access.code || 403,
+        });
+        return;
+      }
+
       if (user.role !== 'teacher' && user.role !== 'admin') {
         socket.emit('error', { message: '无权限' });
         return;
@@ -163,6 +231,16 @@ export function setupSocketIO(io: Server) {
     });
 
     socket.on('answer_question', async ({ roomId, messageId, answer }: { roomId: string; messageId: string; answer: string }) => {
+      const access = verifyRoomAccess(socket, roomId, user);
+      if (!access.allowed) {
+        socket.emit('action_denied', {
+          action: 'answer_question',
+          message: access.reason || '无权操作',
+          code: access.code || 403,
+        });
+        return;
+      }
+
       if (user.role !== 'teacher' && user.role !== 'admin') {
         socket.emit('error', { message: '无权限' });
         return;
@@ -195,6 +273,16 @@ export function setupSocketIO(io: Server) {
     });
 
     socket.on('like', async ({ roomId, count = 1 }: { roomId: string; count?: number }) => {
+      const access = verifyRoomAccess(socket, roomId, user);
+      if (!access.allowed) {
+        socket.emit('action_denied', {
+          action: 'like',
+          message: access.reason || '无权操作',
+          code: access.code || 403,
+        });
+        return;
+      }
+
       const safeCount = Math.min(100, Math.max(1, count));
       const id = uuidv4();
       const now = Date.now();
@@ -218,6 +306,16 @@ export function setupSocketIO(io: Server) {
       amount: number;
       message?: string;
     }) => {
+      const access = verifyRoomAccess(socket, roomId, user);
+      if (!access.allowed) {
+        socket.emit('action_denied', {
+          action: 'reward',
+          message: access.reason || '无权操作',
+          code: access.code || 403,
+        });
+        return;
+      }
+
       if (!gift_type || !amount || amount <= 0) {
         socket.emit('error', { message: '打赏参数无效' });
         return;
@@ -252,6 +350,7 @@ export function setupSocketIO(io: Server) {
 
     socket.on('leave_room', ({ roomId }: { roomId: string }) => {
       socket.leave(roomId);
+      markLeftRoom(socket.id, roomId);
 
       if (roomSockets.has(roomId)) {
         roomSockets.get(roomId)!.delete(socket.id);
@@ -291,40 +390,43 @@ export function setupSocketIO(io: Server) {
     });
 
     socket.on('disconnect', () => {
-      for (const [roomId, sockets] of roomSockets.entries()) {
-        if (sockets.has(socket.id)) {
-          sockets.delete(socket.id);
+      const joinedRoomIds = new Set(socketRooms.get(socket.id) || []);
+      clearSocketRooms(socket.id);
 
-          let hasOtherSockets = false;
-          for (const sid of sockets) {
+      for (const roomId of joinedRoomIds) {
+        let hasOtherSockets = false;
+        const socketsInRoom = roomSockets.get(roomId);
+        if (socketsInRoom) {
+          for (const sid of socketsInRoom) {
+            if (sid === socket.id) continue;
             const s = io.sockets.sockets.get(sid);
             if (s && (s as any).user?.userId === user.userId) {
               hasOtherSockets = true;
               break;
             }
           }
-
-          if (!hasOtherSockets) {
-            removeOnlineUser(roomId, user.userId);
-          }
-
-          const now = Date.now();
-          const session = db.prepare(
-            'SELECT * FROM watch_sessions WHERE room_id = ? AND user_id = ? AND leave_time IS NULL ORDER BY join_time DESC LIMIT 1'
-          ).get(roomId, user.userId) as any;
-
-          if (session) {
-            const duration = Math.floor((now - session.join_time) / 1000);
-            db.prepare('UPDATE watch_sessions SET leave_time = ?, duration = ? WHERE id = ?')
-              .run(now, duration, session.id);
-          }
-
-          io.to(roomId).emit('user_left', {
-            user_id: user.userId,
-            username: user.username,
-            online_count: getOnlineCount(roomId),
-          });
         }
+
+        if (!hasOtherSockets) {
+          removeOnlineUser(roomId, user.userId);
+        }
+
+        const now = Date.now();
+        const session = db.prepare(
+          'SELECT * FROM watch_sessions WHERE room_id = ? AND user_id = ? AND leave_time IS NULL ORDER BY join_time DESC LIMIT 1'
+        ).get(roomId, user.userId) as any;
+
+        if (session) {
+          const duration = Math.floor((now - session.join_time) / 1000);
+          db.prepare('UPDATE watch_sessions SET leave_time = ?, duration = ? WHERE id = ?')
+            .run(now, duration, session.id);
+        }
+
+        io.to(roomId).emit('user_left', {
+          user_id: user.userId,
+          username: user.username,
+          online_count: getOnlineCount(roomId),
+        });
       }
     });
   });

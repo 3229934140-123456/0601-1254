@@ -4,32 +4,35 @@ import { v4 as uuidv4 } from 'uuid';
 import db from '../database';
 import { success, error } from '../utils/response';
 import { authMiddleware } from '../middleware/auth';
+import { checkRoomAccess } from '../services/roomAccess';
 
 const router = Router();
 
 const likeSchema = z.object({
   count: z.number().min(1).max(100).default(1),
+  watch_token: z.string().optional(),
 });
 
 const rewardSchema = z.object({
   gift_type: z.string().min(1).max(50),
   amount: z.number().min(1).max(1000000),
   message: z.string().max(200).optional(),
+  watch_token: z.string().optional(),
 });
 
 router.post('/:roomId/like', authMiddleware, (req: Request, res: Response) => {
   const { roomId } = req.params;
-  const { userId } = (req as any).user;
+  const { userId, role } = (req as any).user;
 
   const parseResult = likeSchema.safeParse(req.body);
   if (!parseResult.success) {
     return error(res, parseResult.error.errors[0].message, 400);
   }
-  const { count } = parseResult.data;
+  const { count, watch_token } = parseResult.data;
 
-  const room = db.prepare('SELECT * FROM live_rooms WHERE id = ?').get(roomId);
-  if (!room) {
-    return error(res, '直播间不存在', 404);
+  const accessResult = checkRoomAccess(roomId, userId, role, watch_token);
+  if (!accessResult.allowed) {
+    return error(res, accessResult.reason || '无权操作', accessResult.code || 403);
   }
 
   const id = uuidv4();
@@ -61,17 +64,17 @@ router.get('/:roomId/likes', authMiddleware, (req: Request, res: Response) => {
 
 router.post('/:roomId/reward', authMiddleware, (req: Request, res: Response) => {
   const { roomId } = req.params;
-  const { userId } = (req as any).user;
+  const { userId, role } = (req as any).user;
 
   const parseResult = rewardSchema.safeParse(req.body);
   if (!parseResult.success) {
     return error(res, parseResult.error.errors[0].message, 400);
   }
-  const { gift_type, amount, message } = parseResult.data;
+  const { gift_type, amount, message, watch_token } = parseResult.data;
 
-  const room = db.prepare('SELECT * FROM live_rooms WHERE id = ?').get(roomId);
-  if (!room) {
-    return error(res, '直播间不存在', 404);
+  const accessResult = checkRoomAccess(roomId, userId, role, watch_token);
+  if (!accessResult.allowed) {
+    return error(res, accessResult.reason || '无权操作', accessResult.code || 403);
   }
 
   const user = db.prepare('SELECT nickname FROM users WHERE id = ?').get(userId) as { nickname?: string };

@@ -6,7 +6,7 @@ import { success, error } from '../utils/response';
 import { authMiddleware, teacherMiddleware } from '../middleware/auth';
 import { containsBannedWord, maskContent } from '../utils/contentFilter';
 import { ChatMessage } from '../types';
-import { isUserMuted, getMuteInfo } from '../services/roomAccess';
+import { isUserMuted, getMuteInfo, checkRoomAccess } from '../services/roomAccess';
 
 const router = Router();
 
@@ -14,6 +14,7 @@ const sendMessageSchema = z.object({
   content: z.string().min(1).max(500),
   msg_type: z.enum(['text', 'emoji']).default('text'),
   is_question: z.boolean().default(false),
+  watch_token: z.string().optional(),
 });
 
 router.post('/:roomId/messages', authMiddleware, (req: Request, res: Response) => {
@@ -24,11 +25,11 @@ router.post('/:roomId/messages', authMiddleware, (req: Request, res: Response) =
   if (!parseResult.success) {
     return error(res, parseResult.error.errors[0].message, 400);
   }
-  const { content, msg_type, is_question } = parseResult.data;
+  const { content, msg_type, is_question, watch_token } = parseResult.data;
 
-  const room = db.prepare('SELECT * FROM live_rooms WHERE id = ?').get(roomId);
-  if (!room) {
-    return error(res, '直播间不存在', 404);
+  const accessResult = checkRoomAccess(roomId, userId, role, watch_token);
+  if (!accessResult.allowed) {
+    return error(res, accessResult.reason || '无权发送消息', accessResult.code || 403);
   }
 
   if (role !== 'teacher' && role !== 'admin') {
@@ -45,14 +46,16 @@ router.post('/:roomId/messages', authMiddleware, (req: Request, res: Response) =
   const user = db.prepare('SELECT nickname FROM users WHERE id = ?').get(userId) as { nickname?: string };
 
   db.prepare(`INSERT INTO chat_messages 
-    (id, room_id, user_id, user_nickname, content, msg_type, is_pinned, is_question, blocked, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`)
+    (id, room_id, user_id, user_nickname, content, original_content, blocked_reason, msg_type, is_pinned, is_question, blocked, handled, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, ?)`)
     .run(
       id,
       roomId,
       userId,
       user?.nickname || '匿名用户',
       banned ? maskContent(content) : content,
+      banned ? content : null,
+      banned || null,
       msg_type,
       is_question ? 1 : 0,
       banned ? 1 : 0,

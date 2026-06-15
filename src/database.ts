@@ -65,6 +65,8 @@ db.exec(`
     user_id TEXT NOT NULL,
     user_nickname TEXT,
     content TEXT NOT NULL,
+    original_content TEXT,
+    blocked_reason TEXT,
     msg_type TEXT NOT NULL DEFAULT 'text',
     is_pinned INTEGER DEFAULT 0,
     is_question INTEGER DEFAULT 0,
@@ -72,6 +74,9 @@ db.exec(`
     answered_by TEXT,
     answered_at INTEGER,
     blocked INTEGER DEFAULT 0,
+    handled INTEGER DEFAULT 0,
+    handled_at INTEGER,
+    handled_by TEXT,
     created_at INTEGER NOT NULL,
     FOREIGN KEY (room_id) REFERENCES live_rooms(id),
     FOREIGN KEY (user_id) REFERENCES users(id)
@@ -152,6 +157,31 @@ if (result.count === 0) {
   for (const word of defaultWords) {
     insertWord.run(uuidv4(), word, now);
   }
+}
+
+function columnExists(table: string, column: string): boolean {
+  try {
+    const row = db.prepare(`PRAGMA table_info(${table})`).all() as any[];
+    return row.some(c => c.name === column);
+  } catch {
+    return false;
+  }
+}
+
+if (!columnExists('chat_messages', 'original_content')) {
+  db.prepare('ALTER TABLE chat_messages ADD COLUMN original_content TEXT').run();
+}
+if (!columnExists('chat_messages', 'blocked_reason')) {
+  db.prepare('ALTER TABLE chat_messages ADD COLUMN blocked_reason TEXT').run();
+}
+if (!columnExists('chat_messages', 'handled')) {
+  db.prepare('ALTER TABLE chat_messages ADD COLUMN handled INTEGER DEFAULT 0').run();
+}
+if (!columnExists('chat_messages', 'handled_at')) {
+  db.prepare('ALTER TABLE chat_messages ADD COLUMN handled_at INTEGER').run();
+}
+if (!columnExists('chat_messages', 'handled_by')) {
+  db.prepare('ALTER TABLE chat_messages ADD COLUMN handled_by TEXT').run();
 }
 
 export default db;
