@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
+import { v4 as uuidv4 } from 'uuid';
 import db from '../database';
 import { success, error } from '../utils/response';
 import { authMiddleware, teacherMiddleware } from '../middleware/auth';
@@ -17,7 +18,25 @@ const muteSchema = z.object({
   user_id: z.string(),
   duration_minutes: z.number().min(1).max(1440).default(30),
   reason: z.string().max(200).optional(),
+  note: z.string().max(500).optional(),
 });
+
+function writeModLog(params: {
+  roomId: string;
+  action: string;
+  targetType: string;
+  targetId: string;
+  operatorId: string;
+  note?: string;
+  extra?: Record<string, any>;
+}) {
+  const id = uuidv4();
+  const now = Date.now();
+  db.prepare(`INSERT INTO moderation_logs (id, room_id, action, target_type, target_id, operator_id, note, extra, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, params.roomId, params.action, params.targetType, params.targetId,
+      params.operatorId, params.note || null, params.extra ? JSON.stringify(params.extra) : null, now);
+}
 
 router.get('/:roomId/blocked-messages', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
   const { roomId } = req.params;
@@ -128,7 +147,7 @@ router.post('/:roomId/mute', authMiddleware, teacherMiddleware, (req: Request, r
   if (!parseResult.success) {
     return error(res, parseResult.error.errors[0].message, 400);
   }
-  const { user_id, duration_minutes, reason } = parseResult.data;
+  const { user_id, duration_minutes, reason, note } = parseResult.data;
 
   const room = db.prepare('SELECT * FROM live_rooms WHERE id = ?').get(roomId);
   if (!room) {
@@ -154,6 +173,16 @@ router.post('/:roomId/mute', authMiddleware, teacherMiddleware, (req: Request, r
     operatorId
   );
 
+  writeModLog({
+    roomId,
+    action: 'mute',
+    targetType: 'user',
+    targetId: user_id,
+    operatorId,
+    note: note || reason,
+    extra: { duration_minutes, mute_until: muteInfo.mute_until },
+  });
+
   const io = (req as any).io;
   if (io) {
     io.to(roomId).emit('user_muted', {
@@ -176,7 +205,7 @@ router.post('/:roomId/mute', authMiddleware, teacherMiddleware, (req: Request, r
 
 router.post('/:roomId/unmute', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
   const { roomId } = req.params;
-  const { user_id } = req.body;
+  const { user_id, note } = req.body;
   const { userId: operatorId } = (req as any).user;
 
   if (!user_id) {
@@ -193,6 +222,15 @@ router.post('/:roomId/unmute', authMiddleware, teacherMiddleware, (req: Request,
   }
 
   unmuteUser(roomId, user_id);
+
+  writeModLog({
+    roomId,
+    action: 'unmute',
+    targetType: 'user',
+    targetId: user_id,
+    operatorId,
+    note: note || '解除禁言',
+  });
 
   const io = (req as any).io;
   if (io) {
@@ -259,7 +297,7 @@ router.get('/:roomId/mute-records', authMiddleware, teacherMiddleware, (req: Req
 router.post('/:roomId/blocked-messages/:msgId/handle', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
   const { roomId, msgId } = req.params;
   const { userId: operatorId } = (req as any).user;
-  const { action = 'mark_handled' } = req.body;
+  const { action = 'mark_handled', note } = req.body;
 
   const msg = db.prepare('SELECT * FROM chat_messages WHERE id = ? AND room_id = ? AND blocked = 1')
     .get(msgId, roomId);
@@ -270,6 +308,15 @@ router.post('/:roomId/blocked-messages/:msgId/handle', authMiddleware, teacherMi
   const now = Date.now();
   db.prepare('UPDATE chat_messages SET handled = 1, handled_at = ?, handled_by = ? WHERE id = ?')
     .run(now, operatorId, msgId);
+
+  writeModLog({
+    roomId,
+    action: 'handle_message',
+    targetType: 'message',
+    targetId: msgId,
+    operatorId,
+    note: note || '标记已处理',
+  });
 
   const updated = db.prepare(`
     SELECT cm.*, u.username, u.nickname, u.avatar,
@@ -286,7 +333,7 @@ router.post('/:roomId/blocked-messages/:msgId/handle', authMiddleware, teacherMi
 router.post('/:roomId/blocked-messages/:msgId/mute', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
   const { roomId, msgId } = req.params;
   const { userId: operatorId, role } = (req as any).user;
-  const { duration_minutes = 30, reason } = req.body;
+  const { duration_minutes = 30, reason, note } = req.body;
 
   const msg = db.prepare('SELECT * FROM chat_messages WHERE id = ? AND room_id = ? AND blocked = 1')
     .get(msgId, roomId);
@@ -321,6 +368,16 @@ router.post('/:roomId/blocked-messages/:msgId/mute', authMiddleware, teacherMidd
   db.prepare('UPDATE chat_messages SET handled = 1, handled_at = ?, handled_by = ? WHERE id = ?')
     .run(now, operatorId, msgId);
 
+  writeModLog({
+    roomId,
+    action: 'mute_via_message',
+    targetType: 'message',
+    targetId: msgId,
+    operatorId,
+    note: note || `根据拦截消息禁言用户 ${userId}`,
+    extra: { muted_user: userId, duration_minutes: safeDuration, mute_until: muteInfo.mute_until },
+  });
+
   const io = (req as any).io;
   if (io) {
     io.to(roomId).emit('user_muted', {
@@ -345,7 +402,7 @@ router.post('/:roomId/blocked-messages/:msgId/mute', authMiddleware, teacherMidd
 router.post('/:roomId/blocked-messages/batch-handle', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
   const { roomId } = req.params;
   const { userId: operatorId } = (req as any).user;
-  const { message_ids } = req.body;
+  const { message_ids, note } = req.body;
 
   if (!Array.isArray(message_ids) || message_ids.length === 0) {
     return error(res, '请提供消息ID列表', 400);
@@ -357,7 +414,95 @@ router.post('/:roomId/blocked-messages/batch-handle', authMiddleware, teacherMid
     WHERE room_id = ? AND blocked = 1 AND id IN (${placeholders})`)
     .run(now, operatorId, roomId, ...message_ids);
 
+  writeModLog({
+    roomId,
+    action: 'batch_handle',
+    targetType: 'message_batch',
+    targetId: message_ids.join(','),
+    operatorId,
+    note: note || `批量处理 ${message_ids.length} 条消息`,
+    extra: { count: message_ids.length },
+  });
+
   success(res, { handled_count: message_ids.length }, '批量处理成功');
+});
+
+router.get('/:roomId/logs', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { roomId } = req.params;
+  const { page = '1', page_size = '50', action, target_type } = req.query;
+
+  const pageNum = Math.max(1, Number(page));
+  const pageSize = Math.min(200, Math.max(1, Number(page_size)));
+  const offset = (pageNum - 1) * pageSize;
+
+  let where = 'ml.room_id = ?';
+  const params: any[] = [roomId];
+
+  if (action) {
+    where += ' AND ml.action = ?';
+    params.push(action);
+  }
+  if (target_type) {
+    where += ' AND ml.target_type = ?';
+    params.push(target_type);
+  }
+
+  const totalRow = db.prepare(
+    `SELECT COUNT(*) as count FROM moderation_logs ml WHERE ${where}`
+  ).get(...params) as { count: number };
+
+  const rows = db.prepare(`
+    SELECT ml.*,
+      ou.username as operator_username,
+      ou.nickname as operator_nickname,
+      ou.avatar as operator_avatar
+    FROM moderation_logs ml
+    LEFT JOIN users ou ON ml.operator_id = ou.id
+    WHERE ${where}
+    ORDER BY ml.created_at DESC
+    LIMIT ? OFFSET ?
+  `).all(...params, pageSize, offset);
+
+  const list = (Array.isArray(rows) ? rows : []).map((row: any) => ({
+    ...row,
+    extra: row.extra ? JSON.parse(row.extra) : null,
+  }));
+
+  success(res, {
+    list,
+    total: totalRow.count,
+    page: pageNum,
+    page_size: pageSize,
+    empty: totalRow.count === 0,
+  }, totalRow.count === 0 ? '暂无操作记录' : 'success');
+});
+
+router.get('/:roomId/logs/target/:targetType/:targetId', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { roomId, targetType, targetId } = req.params;
+
+  const rows = db.prepare(`
+    SELECT ml.*,
+      ou.username as operator_username,
+      ou.nickname as operator_nickname,
+      ou.avatar as operator_avatar
+    FROM moderation_logs ml
+    LEFT JOIN users ou ON ml.operator_id = ou.id
+    WHERE ml.room_id = ? AND ml.target_type = ? AND ml.target_id = ?
+    ORDER BY ml.created_at DESC
+  `).all(roomId, targetType, targetId);
+
+  const list = (Array.isArray(rows) ? rows : []).map((row: any) => ({
+    ...row,
+    extra: row.extra ? JSON.parse(row.extra) : null,
+  }));
+
+  success(res, {
+    target_type: targetType,
+    target_id: targetId,
+    list,
+    total: list.length,
+    empty: list.length === 0,
+  }, list.length === 0 ? '暂无操作记录' : 'success');
 });
 
 export default router;

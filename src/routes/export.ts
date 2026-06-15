@@ -490,7 +490,7 @@ router.get('/:roomId/trends', authMiddleware, teacherMiddleware, (req: Request, 
     }
   }
 
-  const trends = buckets.map((bucketStart, idx) => {
+  const allTrends = buckets.map((bucketStart, idx) => {
     const msg = msgData.get(idx) || { count: 0, users: new Set() };
     const like = likeData.get(idx) || { count: 0, total: 0, users: new Set() };
     const reward = rewardData.get(idx) || { count: 0, amount: 0, users: new Set() };
@@ -511,6 +511,8 @@ router.get('/:roomId/trends', authMiddleware, teacherMiddleware, (req: Request, 
     };
   });
 
+  const trends = allTrends.filter(t => t.messages > 0 || t.likes > 0 || t.rewards > 0 || t.active_users > 0);
+
   const totalMessages = messages.length;
   const totalLikes = likes.reduce((sum: number, l: any) => sum + l.count, 0);
   const totalRewards = rewards.length;
@@ -527,7 +529,7 @@ router.get('/:roomId/trends', authMiddleware, teacherMiddleware, (req: Request, 
     start_time: startTime,
     end_time: endTime,
     total_points: trends.length,
-    empty: trends.length === 0 || trends.every(t => t.interactions === 0 && t.active_users === 0),
+    empty: trends.length === 0,
     summary: {
       total_messages: totalMessages,
       total_likes: totalLikes,
@@ -538,8 +540,9 @@ router.get('/:roomId/trends', authMiddleware, teacherMiddleware, (req: Request, 
       unique_like_users: uniqueLikeUsers,
       unique_reward_users: uniqueRewardUsers,
       unique_active_users: uniqueActiveUsers,
-      peak_active_users: Math.max(...trends.map(t => t.active_users), 0),
-      peak_interactions: Math.max(...trends.map(t => t.interactions), 0),
+      peak_active_users: trends.length > 0 ? Math.max(...trends.map(t => t.active_users)) : 0,
+      peak_messages: trends.length > 0 ? Math.max(...trends.map(t => t.messages)) : 0,
+      peak_interactions: trends.length > 0 ? Math.max(...trends.map(t => t.interactions)) : 0,
     },
     trends,
   }, trends.length === 0 ? '暂无趋势数据' : 'success');
@@ -746,6 +749,531 @@ router.get('/report/courses', authMiddleware, teacherMiddleware, async (req: Req
     empty: totalRow.count === 0,
     summary,
   }, totalRow.count === 0 ? '暂无课程数据' : 'success');
+});
+
+router.get('/report/teachers', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { userId: currentUserId, role } = (req as any).user;
+  const { start_date, end_date, format = 'json' } = req.query;
+
+  let timeWhere = '';
+  const timeParams: any[] = [];
+  if (start_date) {
+    timeWhere += ' AND lr.start_time >= ?';
+    timeParams.push(Number(start_date));
+  }
+  if (end_date) {
+    timeWhere += ' AND lr.start_time <= ?';
+    timeParams.push(Number(end_date));
+  }
+
+  let teacherFilter = '';
+  const teacherParams: any[] = [];
+  if (role === 'teacher') {
+    teacherFilter = ' AND u.id = ?';
+    teacherParams.push(currentUserId);
+  }
+
+  const teachers = db.prepare(`
+    SELECT u.id as teacher_id, u.username, u.nickname, u.avatar
+    FROM users u
+    WHERE u.role IN ('teacher', 'admin')${teacherFilter}
+  `).all(...teacherParams) as any[];
+
+  const teacherStats = teachers.map(t => {
+    const roomStats = db.prepare(`
+      SELECT
+        COUNT(lr.id) as course_count,
+        COALESCE(SUM(enroll.cnt), 0) as total_enrollments,
+        COALESCE(SUM(viewer.cnt), 0) as total_viewers,
+        COALESCE(SUM(ws_dur.total_duration), 0) as total_watch_seconds,
+        COALESCE(SUM(ws_dur.viewer_count), 0) as total_viewer_count,
+        COALESCE(SUM(msg.cnt), 0) as total_messages,
+        COALESCE(SUM(blocked.cnt), 0) as total_blocked,
+        COALESCE(SUM(like_total.cnt), 0) as total_likes,
+        COALESCE(SUM(reward_total.amount), 0) as total_rewards,
+        COALESCE(SUM(reward_total.cnt), 0) as total_reward_count,
+        COALESCE(SUM(mute_total.cnt), 0) as total_muted
+      FROM live_rooms lr
+      LEFT JOIN (SELECT room_id, COUNT(*) as cnt FROM room_enrollments GROUP BY room_id) enroll ON enroll.room_id = lr.id
+      LEFT JOIN (SELECT room_id, COUNT(DISTINCT user_id) as cnt FROM watch_sessions GROUP BY room_id) viewer ON viewer.room_id = lr.id
+      LEFT JOIN (SELECT room_id, SUM(duration) as total_duration, COUNT(DISTINCT user_id) as viewer_count FROM watch_sessions GROUP BY room_id) ws_dur ON ws_dur.room_id = lr.id
+      LEFT JOIN (SELECT room_id, COUNT(*) as cnt FROM chat_messages WHERE blocked = 0 GROUP BY room_id) msg ON msg.room_id = lr.id
+      LEFT JOIN (SELECT room_id, COUNT(*) as cnt FROM chat_messages WHERE blocked = 1 GROUP BY room_id) blocked ON blocked.room_id = lr.id
+      LEFT JOIN (SELECT room_id, SUM(count) as cnt FROM likes GROUP BY room_id) like_total ON like_total.room_id = lr.id
+      LEFT JOIN (SELECT room_id, SUM(amount) as amount, COUNT(*) as cnt FROM rewards GROUP BY room_id) reward_total ON reward_total.room_id = lr.id
+      LEFT JOIN (SELECT room_id, COUNT(DISTINCT user_id) as cnt FROM mutes GROUP BY room_id) mute_total ON mute_total.room_id = lr.id
+      WHERE lr.teacher_id = ?${timeWhere}
+    `).get(t.teacher_id, ...timeParams) as any;
+
+    const courseCount = roomStats.course_count || 0;
+    const totalEnrollments = roomStats.total_enrollments || 0;
+    const totalViewers = roomStats.total_viewers || 0;
+    const totalWatchSeconds = roomStats.total_watch_seconds || 0;
+    const totalViewerCount = roomStats.total_viewer_count || 0;
+    const avgWatchSeconds = totalViewerCount > 0 ? Math.floor(totalWatchSeconds / totalViewerCount) : 0;
+    const attendanceRate = totalEnrollments > 0 ? Math.round((totalViewers / totalEnrollments) * 10000) / 100 : 0;
+    const totalMessages = roomStats.total_messages || 0;
+    const totalLikes = roomStats.total_likes || 0;
+    const totalRewardCount = roomStats.total_reward_count || 0;
+    const totalInteractions = totalMessages + totalLikes + totalRewardCount;
+
+    return {
+      teacher_id: t.teacher_id,
+      username: t.username,
+      nickname: t.nickname,
+      avatar: t.avatar,
+      stats: {
+        course_count: courseCount,
+        total_enrollments: totalEnrollments,
+        total_viewers: totalViewers,
+        attendance_rate: attendanceRate,
+        total_watch_seconds: totalWatchSeconds,
+        avg_watch_seconds: avgWatchSeconds,
+        avg_watch_formatted: formatDuration(avgWatchSeconds),
+        total_messages: totalMessages,
+        total_blocked: roomStats.total_blocked || 0,
+        total_likes: totalLikes,
+        total_rewards: roomStats.total_rewards || 0,
+        total_interactions: totalInteractions,
+        total_muted: roomStats.total_muted || 0,
+      },
+    };
+  });
+
+  const nonEmptyTeachers = teacherStats.filter(t => t.stats.course_count > 0);
+
+  const overallSummary = {
+    total_teachers: nonEmptyTeachers.length,
+    total_courses: nonEmptyTeachers.reduce((s, t) => s + t.stats.course_count, 0),
+    total_enrollments: nonEmptyTeachers.reduce((s, t) => s + t.stats.total_enrollments, 0),
+    total_viewers: nonEmptyTeachers.reduce((s, t) => s + t.stats.total_viewers, 0),
+    total_interactions: nonEmptyTeachers.reduce((s, t) => s + t.stats.total_interactions, 0),
+    total_rewards: nonEmptyTeachers.reduce((s, t) => s + t.stats.total_rewards, 0),
+    avg_attendance_rate: nonEmptyTeachers.length > 0
+      ? Math.round(nonEmptyTeachers.reduce((s, t) => s + t.stats.attendance_rate, 0) / nonEmptyTeachers.length * 100) / 100
+      : 0,
+  };
+
+  if (format === 'csv') {
+    const fileName = `teacher_report_${Date.now()}.csv`;
+    const filePath = path.join(exportDir, fileName);
+    const csvWriter = createObjectCsvWriter({
+      path: filePath,
+      header: [
+        { id: 'teacher_id', title: '讲师ID' },
+        { id: 'nickname', title: '讲师' },
+        { id: 'course_count', title: '开课数' },
+        { id: 'total_enrollments', title: '总报名' },
+        { id: 'total_viewers', title: '总到课' },
+        { id: 'attendance_rate', title: '到课率(%)' },
+        { id: 'avg_watch_formatted', title: '平均观看' },
+        { id: 'total_messages', title: '消息数' },
+        { id: 'total_blocked', title: '违规消息' },
+        { id: 'total_likes', title: '点赞数' },
+        { id: 'total_rewards', title: '打赏金额' },
+        { id: 'total_muted', title: '禁言人数' },
+        { id: 'total_interactions', title: '互动总数' },
+      ],
+    });
+    const records = nonEmptyTeachers.map(t => ({
+      teacher_id: t.teacher_id,
+      nickname: t.nickname || t.username,
+      course_count: t.stats.course_count,
+      total_enrollments: t.stats.total_enrollments,
+      total_viewers: t.stats.total_viewers,
+      attendance_rate: t.stats.attendance_rate,
+      avg_watch_formatted: t.stats.avg_watch_formatted,
+      total_messages: t.stats.total_messages,
+      total_blocked: t.stats.total_blocked,
+      total_likes: t.stats.total_likes,
+      total_rewards: t.stats.total_rewards,
+      total_muted: t.stats.total_muted,
+      total_interactions: t.stats.total_interactions,
+    }));
+    (async () => {
+      await csvWriter.writeRecords(records);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      const fileStream = fs.createReadStream(filePath);
+      fileStream.pipe(res);
+      fileStream.on('end', () => { fs.unlink(filePath, () => {}); });
+    })();
+    return;
+  }
+
+  success(res, {
+    list: nonEmptyTeachers,
+    summary: overallSummary,
+    empty: nonEmptyTeachers.length === 0,
+  }, nonEmptyTeachers.length === 0 ? '暂无讲师数据' : 'success');
+});
+
+router.get('/report/teachers/:teacherId/courses', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { teacherId } = req.params;
+  const { userId: currentUserId, role } = (req as any).user;
+  const { start_date, end_date, page = '1', page_size = '50' } = req.query;
+
+  if (role === 'teacher' && teacherId !== currentUserId) {
+    return error(res, '无权查看其他讲师的课程', 403);
+  }
+
+  let where = 'lr.teacher_id = ?';
+  const params: any[] = [teacherId];
+
+  if (start_date) {
+    where += ' AND lr.start_time >= ?';
+    params.push(Number(start_date));
+  }
+  if (end_date) {
+    where += ' AND lr.start_time <= ?';
+    params.push(Number(end_date));
+  }
+
+  const pageNum = Math.max(1, Number(page));
+  const pageSize = Math.min(200, Math.max(1, Number(page_size)));
+  const offset = (pageNum - 1) * pageSize;
+
+  const totalRow = db.prepare(`SELECT COUNT(*) as count FROM live_rooms lr WHERE ${where}`)
+    .get(...params) as { count: number };
+
+  const rooms = db.prepare(`
+    SELECT lr.*, u.nickname as teacher_name
+    FROM live_rooms lr
+    LEFT JOIN users u ON lr.teacher_id = u.id
+    WHERE ${where}
+    ORDER BY lr.start_time DESC
+    LIMIT ? OFFSET ?
+  `).all(...params, pageSize, offset) as any[];
+
+  const courseStats = rooms.map(room => {
+    const roomId = room.id;
+    const enrollmentRow = db.prepare('SELECT COUNT(*) as count FROM room_enrollments WHERE room_id = ?')
+      .get(roomId) as { count: number };
+    const viewerRow = db.prepare('SELECT COUNT(DISTINCT user_id) as count FROM watch_sessions WHERE room_id = ?')
+      .get(roomId) as { count: number };
+    const durationRow = db.prepare('SELECT SUM(duration) as total, COUNT(DISTINCT user_id) as users FROM watch_sessions WHERE room_id = ?')
+      .get(roomId) as { total: number; users: number };
+    const messageRow = db.prepare('SELECT COUNT(*) as count FROM chat_messages WHERE room_id = ? AND blocked = 0')
+      .get(roomId) as { count: number };
+    const blockedMsgRow = db.prepare('SELECT COUNT(*) as count FROM chat_messages WHERE room_id = ? AND blocked = 1')
+      .get(roomId) as { count: number };
+    const likeRow = db.prepare('SELECT SUM(count) as total, COUNT(DISTINCT user_id) as users FROM likes WHERE room_id = ?')
+      .get(roomId) as { total: number; users: number };
+    const rewardRow = db.prepare('SELECT SUM(amount) as total, COUNT(*) as count, COUNT(DISTINCT user_id) as users FROM rewards WHERE room_id = ?')
+      .get(roomId) as { total: number; count: number; users: number };
+    const muteRow = db.prepare('SELECT COUNT(DISTINCT user_id) as count FROM mutes WHERE room_id = ?')
+      .get(roomId) as { count: number };
+
+    const enrollments = enrollmentRow.count;
+    const actualViewers = viewerRow.count;
+    const totalWatchSeconds = durationRow.total || 0;
+    const avgWatchSeconds = (durationRow.users || 0) > 0 ? Math.floor(totalWatchSeconds / durationRow.users) : 0;
+    const attendanceRate = enrollments > 0 ? Math.round((actualViewers / enrollments) * 10000) / 100 : 0;
+
+    return {
+      room_id: roomId,
+      title: room.title,
+      start_time: room.start_time,
+      end_time: room.end_time,
+      status: room.status,
+      stats: {
+        enrollments,
+        actual_viewers: actualViewers,
+        attendance_rate: attendanceRate,
+        avg_watch_seconds: avgWatchSeconds,
+        avg_watch_formatted: formatDuration(avgWatchSeconds),
+        total_messages: messageRow.count,
+        blocked_messages: blockedMsgRow.count,
+        total_likes: likeRow.total || 0,
+        total_rewards: rewardRow.total || 0,
+        total_interactions: messageRow.count + (likeRow.total || 0) + rewardRow.count,
+        muted_users: muteRow.count,
+      },
+    };
+  });
+
+  const teacher = db.prepare('SELECT id, username, nickname, avatar FROM users WHERE id = ?').get(teacherId);
+
+  success(res, {
+    teacher,
+    list: courseStats,
+    total: totalRow.count,
+    page: pageNum,
+    page_size: pageSize,
+    has_more: pageNum * pageSize < totalRow.count,
+    empty: totalRow.count === 0,
+  }, totalRow.count === 0 ? '该讲师暂无课程数据' : 'success');
+});
+
+const exportTaskRunners: Record<string, (params: any, filePath: string) => Promise<void>> = {};
+
+exportTaskRunners['course_report'] = async (params: any, filePath: string) => {
+  const { teacher_id, start_date, end_date, status } = params;
+  let where = '1=1';
+  const sqlParams: any[] = [];
+  if (teacher_id) { where += ' AND lr.teacher_id = ?'; sqlParams.push(teacher_id); }
+  if (start_date) { where += ' AND lr.start_time >= ?'; sqlParams.push(Number(start_date)); }
+  if (end_date) { where += ' AND lr.start_time <= ?'; sqlParams.push(Number(end_date)); }
+  if (status) { where += ' AND lr.status = ?'; sqlParams.push(status); }
+
+  const rooms = db.prepare(`
+    SELECT lr.*, u.nickname as teacher_name
+    FROM live_rooms lr LEFT JOIN users u ON lr.teacher_id = u.id
+    WHERE ${where} ORDER BY lr.start_time DESC
+  `).all(...sqlParams) as any[];
+
+  const csvWriter = createObjectCsvWriter({
+    path: filePath,
+    header: [
+      { id: 'room_id', title: '课程ID' },
+      { id: 'title', title: '课程标题' },
+      { id: 'teacher_name', title: '讲师' },
+      { id: 'start_time', title: '开始时间' },
+      { id: 'end_time', title: '结束时间' },
+      { id: 'status', title: '状态' },
+      { id: 'enrollments', title: '报名人数' },
+      { id: 'actual_viewers', title: '到课人数' },
+      { id: 'attendance_rate', title: '到课率(%)' },
+      { id: 'avg_watch_formatted', title: '平均观看时长' },
+      { id: 'total_messages', title: '消息数' },
+      { id: 'blocked_messages', title: '违规消息数' },
+      { id: 'total_likes', title: '点赞数' },
+      { id: 'total_rewards', title: '打赏金额' },
+      { id: 'muted_users', title: '禁言人数' },
+    ],
+  });
+
+  const records = rooms.map(room => {
+    const roomId = room.id;
+    const enrollmentRow = db.prepare('SELECT COUNT(*) as count FROM room_enrollments WHERE room_id = ?').get(roomId) as { count: number };
+    const viewerRow = db.prepare('SELECT COUNT(DISTINCT user_id) as count FROM watch_sessions WHERE room_id = ?').get(roomId) as { count: number };
+    const durationRow = db.prepare('SELECT SUM(duration) as total, COUNT(DISTINCT user_id) as users FROM watch_sessions WHERE room_id = ?').get(roomId) as { total: number; users: number };
+    const messageRow = db.prepare('SELECT COUNT(*) as count FROM chat_messages WHERE room_id = ? AND blocked = 0').get(roomId) as { count: number };
+    const blockedMsgRow = db.prepare('SELECT COUNT(*) as count FROM chat_messages WHERE room_id = ? AND blocked = 1').get(roomId) as { count: number };
+    const likeRow = db.prepare('SELECT SUM(count) as total FROM likes WHERE room_id = ?').get(roomId) as { total: number };
+    const rewardRow = db.prepare('SELECT SUM(amount) as total FROM rewards WHERE room_id = ?').get(roomId) as { total: number };
+    const muteRow = db.prepare('SELECT COUNT(DISTINCT user_id) as count FROM mutes WHERE room_id = ?').get(roomId) as { count: number };
+    const avgWatchSeconds = (durationRow.users || 0) > 0 ? Math.floor((durationRow.total || 0) / durationRow.users) : 0;
+    return {
+      room_id: roomId,
+      title: room.title,
+      teacher_name: room.teacher_name,
+      start_time: new Date(room.start_time).toLocaleString('zh-CN'),
+      end_time: new Date(room.end_time).toLocaleString('zh-CN'),
+      status: room.status === 'scheduled' ? '未开始' : room.status === 'live' ? '直播中' : '已结束',
+      enrollments: enrollmentRow.count,
+      actual_viewers: viewerRow.count,
+      attendance_rate: enrollmentRow.count > 0 ? Math.round((viewerRow.count / enrollmentRow.count) * 10000) / 100 : 0,
+      avg_watch_formatted: formatDuration(avgWatchSeconds),
+      total_messages: messageRow.count,
+      blocked_messages: blockedMsgRow.count,
+      total_likes: likeRow.total || 0,
+      total_rewards: rewardRow.total || 0,
+      muted_users: muteRow.count,
+    };
+  });
+
+  await csvWriter.writeRecords(records);
+};
+
+exportTaskRunners['teacher_report'] = async (params: any, filePath: string) => {
+  const { start_date, end_date } = params;
+  const teachers = db.prepare(`SELECT u.id as teacher_id, u.username, u.nickname FROM users u WHERE u.role IN ('teacher', 'admin')`)
+    .all() as any[];
+
+  const csvWriter = createObjectCsvWriter({
+    path: filePath,
+    header: [
+      { id: 'teacher_id', title: '讲师ID' },
+      { id: 'nickname', title: '讲师' },
+      { id: 'course_count', title: '开课数' },
+      { id: 'total_enrollments', title: '总报名' },
+      { id: 'total_viewers', title: '总到课' },
+      { id: 'total_rewards', title: '打赏金额' },
+      { id: 'total_muted', title: '禁言人数' },
+    ],
+  });
+
+  const records = teachers.map(t => {
+    let timeWhere = '';
+    const timeParams: any[] = [t.teacher_id];
+    if (start_date) { timeWhere += ' AND lr.start_time >= ?'; timeParams.push(Number(start_date)); }
+    if (end_date) { timeWhere += ' AND lr.start_time <= ?'; timeParams.push(Number(end_date)); }
+    const stats = db.prepare(`SELECT COUNT(lr.id) as course_count FROM live_rooms lr WHERE lr.teacher_id = ?${timeWhere}`)
+      .get(...timeParams) as { course_count: number };
+    return {
+      teacher_id: t.teacher_id,
+      nickname: t.nickname || t.username,
+      course_count: stats.course_count || 0,
+      total_enrollments: 0,
+      total_viewers: 0,
+      total_rewards: 0,
+      total_muted: 0,
+    };
+  }).filter(r => r.course_count > 0);
+
+  await csvWriter.writeRecords(records);
+};
+
+function runExportTask(taskId: string) {
+  const task = db.prepare('SELECT * FROM export_tasks WHERE id = ?').get(taskId) as any;
+  if (!task) return;
+
+  const runner = exportTaskRunners[task.type];
+  if (!runner) {
+    db.prepare('UPDATE export_tasks SET status = ?, error = ? WHERE id = ?')
+      .run('failed', `不支持的导出类型: ${task.type}`, taskId);
+    return;
+  }
+
+  const fileName = `${task.type}_${taskId}_${Date.now()}.csv`;
+  const filePath = path.join(exportDir, fileName);
+
+  db.prepare('UPDATE export_tasks SET status = ?, started_at = ? WHERE id = ?')
+    .run('processing', Date.now(), taskId);
+
+  runner(JSON.parse(task.params || '{}'), filePath)
+    .then(() => {
+      const stat = fs.statSync(filePath);
+      db.prepare('UPDATE export_tasks SET status = ?, file_path = ?, file_name = ?, file_size = ?, completed_at = ? WHERE id = ?')
+        .run('completed', filePath, fileName, stat.size, Date.now(), taskId);
+    })
+    .catch((err: any) => {
+      db.prepare('UPDATE export_tasks SET status = ?, error = ?, completed_at = ? WHERE id = ?')
+        .run('failed', err.message || '导出失败', Date.now(), taskId);
+    });
+}
+
+router.post('/tasks', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { userId } = (req as any).user;
+  const { type, params } = req.body;
+
+  if (!type) {
+    return error(res, '请提供导出类型', 400);
+  }
+
+  if (!exportTaskRunners[type]) {
+    return error(res, `不支持的导出类型: ${type}，支持: ${Object.keys(exportTaskRunners).join(', ')}`, 400);
+  }
+
+  const id = uuidv4();
+  const now = Date.now();
+
+  db.prepare(`INSERT INTO export_tasks (id, type, params, status, created_by, created_at)
+    VALUES (?, ?, ?, 'pending', ?, ?)`)
+    .run(id, type, JSON.stringify(params || {}), userId, now);
+
+  setImmediate(() => runExportTask(id));
+
+  success(res, {
+    task_id: id,
+    type,
+    status: 'pending',
+    created_at: now,
+  }, '导出任务已创建');
+});
+
+router.get('/tasks/:taskId', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { taskId } = req.params;
+  const { userId, role } = (req as any).user;
+
+  const task = db.prepare('SELECT * FROM export_tasks WHERE id = ?').get(taskId) as any;
+  if (!task) {
+    return error(res, '任务不存在', 404);
+  }
+
+  if (role !== 'admin' && task.created_by !== userId) {
+    return error(res, '无权查看此任务', 403);
+  }
+
+  const result: any = {
+    task_id: task.id,
+    type: task.type,
+    status: task.status,
+    created_at: task.created_at,
+    started_at: task.started_at,
+    completed_at: task.completed_at,
+  };
+
+  if (task.status === 'completed') {
+    result.file_name = task.file_name;
+    result.file_size = task.file_size;
+    result.download_url = `/api/export/tasks/${task.id}/download`;
+  }
+
+  if (task.status === 'failed') {
+    result.error = task.error;
+  }
+
+  success(res, result);
+});
+
+router.get('/tasks/:taskId/download', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { taskId } = req.params;
+  const { userId, role } = (req as any).user;
+
+  const task = db.prepare('SELECT * FROM export_tasks WHERE id = ?').get(taskId) as any;
+  if (!task) {
+    return error(res, '任务不存在', 404);
+  }
+
+  if (role !== 'admin' && task.created_by !== userId) {
+    return error(res, '无权下载此文件', 403);
+  }
+
+  if (task.status !== 'completed') {
+    return error(res, '任务尚未完成', 400);
+  }
+
+  if (!task.file_path || !fs.existsSync(task.file_path)) {
+    return error(res, '文件已过期或不存在', 404);
+  }
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${task.file_name}"`);
+  const fileStream = fs.createReadStream(task.file_path);
+  fileStream.pipe(res);
+});
+
+router.get('/tasks', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { userId, role } = (req as any).user;
+  const { page = '1', page_size = '20', status } = req.query;
+
+  const pageNum = Math.max(1, Number(page));
+  const pageSize = Math.min(100, Math.max(1, Number(page_size)));
+  const offset = (pageNum - 1) * pageSize;
+
+  let where = role === 'admin' ? '1=1' : 'created_by = ?';
+  const params: any[] = role === 'admin' ? [] : [userId];
+
+  if (status) {
+    where += ' AND status = ?';
+    params.push(status);
+  }
+
+  const totalRow = db.prepare(`SELECT COUNT(*) as count FROM export_tasks WHERE ${where}`)
+    .get(...params) as { count: number };
+
+  const rows = db.prepare(`
+    SELECT id, type, status, file_name, file_size, error, created_by, created_at, started_at, completed_at
+    FROM export_tasks WHERE ${where}
+    ORDER BY created_at DESC
+    LIMIT ? OFFSET ?
+  `).all(...params, pageSize, offset);
+
+  const list = (Array.isArray(rows) ? rows : []).map((row: any) => ({
+    ...row,
+    download_url: row.status === 'completed' ? `/api/export/tasks/${row.id}/download` : null,
+  }));
+
+  success(res, {
+    list,
+    total: totalRow.count,
+    page: pageNum,
+    page_size: pageSize,
+    has_more: pageNum * pageSize < totalRow.count,
+    empty: totalRow.count === 0,
+  });
 });
 
 export default router;

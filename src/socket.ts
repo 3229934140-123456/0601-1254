@@ -52,9 +52,12 @@ function verifyRoomAccess(
   if (!hasJoinedRoom(socket.id, roomId)) {
     return { allowed: false, reason: '您尚未进入直播间，请先进入后再操作', code: 403 };
   }
-  const result = checkRoomAccess(roomId, user.userId, user.role);
-  if (!result.allowed) {
-    return { allowed: false, reason: result.reason, code: result.code };
+  const room = db.prepare('SELECT status FROM live_rooms WHERE id = ?').get(roomId) as { status: string } | undefined;
+  if (!room) {
+    return { allowed: false, reason: '直播间不存在', code: 404 };
+  }
+  if (room.status === 'ended') {
+    return { allowed: false, reason: '直播已结束', code: 400 };
   }
   return { allowed: true };
 }

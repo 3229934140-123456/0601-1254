@@ -139,6 +139,42 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_mutes_user ON mutes(user_id);
   CREATE INDEX IF NOT EXISTS idx_mutes_active ON mutes(room_id, user_id, mute_until);
 
+  CREATE TABLE IF NOT EXISTS moderation_logs (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    operator_id TEXT NOT NULL,
+    note TEXT,
+    extra TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (room_id) REFERENCES live_rooms(id),
+    FOREIGN KEY (operator_id) REFERENCES users(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_modlog_room ON moderation_logs(room_id);
+  CREATE INDEX IF NOT EXISTS idx_modlog_target ON moderation_logs(target_type, target_id);
+
+  CREATE TABLE IF NOT EXISTS export_tasks (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    params TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    file_path TEXT,
+    file_name TEXT,
+    file_size INTEGER DEFAULT 0,
+    error TEXT,
+    created_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    started_at INTEGER,
+    completed_at INTEGER,
+    FOREIGN KEY (created_by) REFERENCES users(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_export_tasks_status ON export_tasks(status);
+  CREATE INDEX IF NOT EXISTS idx_export_tasks_creator ON export_tasks(created_by);
+
   CREATE INDEX IF NOT EXISTS idx_rooms_status ON live_rooms(status);
   CREATE INDEX IF NOT EXISTS idx_rooms_time ON live_rooms(start_time);
   CREATE INDEX IF NOT EXISTS idx_msgs_room ON chat_messages(room_id);
