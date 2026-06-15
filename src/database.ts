@@ -117,6 +117,23 @@ db.exec(`
     created_at INTEGER NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS mutes (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    mute_until INTEGER NOT NULL,
+    reason TEXT,
+    created_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (room_id) REFERENCES live_rooms(id),
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (created_by) REFERENCES users(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_mutes_room ON mutes(room_id);
+  CREATE INDEX IF NOT EXISTS idx_mutes_user ON mutes(user_id);
+  CREATE INDEX IF NOT EXISTS idx_mutes_active ON mutes(room_id, user_id, mute_until);
+
   CREATE INDEX IF NOT EXISTS idx_rooms_status ON live_rooms(status);
   CREATE INDEX IF NOT EXISTS idx_rooms_time ON live_rooms(start_time);
   CREATE INDEX IF NOT EXISTS idx_msgs_room ON chat_messages(room_id);

@@ -5,42 +5,25 @@ import db from '../database';
 import { success, error } from '../utils/response';
 import { authMiddleware } from '../middleware/auth';
 import { LiveRoom, WatchSession } from '../types';
+import {
+  checkRoomAccess,
+  addOnlineUser,
+  removeOnlineUser,
+  getOnlineCount,
+  onlineUsersCache,
+  isUserMuted,
+} from '../services/roomAccess';
 
 const router = Router();
-
-const onlineUsers: Map<string, Set<string>> = new Map();
 
 router.post('/:roomId/enter', authMiddleware, (req: Request, res: Response) => {
   const { roomId } = req.params;
   const { userId, role } = (req as any).user;
   const { watch_token } = req.body;
 
-  const room = db.prepare('SELECT * FROM live_rooms WHERE id = ?').get(roomId) as LiveRoom | undefined;
-  if (!room) {
-    return error(res, '直播间不存在', 404);
-  }
-
-  if (room.status === 'ended') {
-    return error(res, '直播已结束', 400);
-  }
-
-  if (room.watch_token && watch_token !== room.watch_token && role !== 'admin' && role !== 'teacher') {
-    return error(res, '观看令牌无效', 403);
-  }
-
-  if (!room.allow_guest && role !== 'admin' && role !== 'teacher') {
-    const enrolled = db.prepare('SELECT id FROM room_enrollments WHERE room_id = ? AND user_id = ?').get(roomId, userId);
-    if (!enrolled) {
-      return error(res, '您未报名此课程，无法进入', 403);
-    }
-  }
-
-  if (room.max_viewers > 0 && role === 'viewer') {
-    const currentOnline = onlineUsers.get(roomId)?.size || 0;
-    const sessions = db.prepare('SELECT COUNT(*) as count FROM watch_sessions WHERE room_id = ? AND leave_time IS NULL').get(roomId) as { count: number };
-    if (Math.max(currentOnline, sessions.count) >= room.max_viewers) {
-      return error(res, '直播间人数已满', 400);
-    }
+  const accessResult = checkRoomAccess(roomId, userId, role, watch_token);
+  if (!accessResult.allowed) {
+    return error(res, accessResult.reason || '无法进入直播间', accessResult.code || 400);
   }
 
   const now = Date.now();
@@ -57,15 +40,15 @@ router.post('/:roomId/enter', authMiddleware, (req: Request, res: Response) => {
       .run(sessionId, roomId, userId, now);
   }
 
-  if (!onlineUsers.has(roomId)) {
-    onlineUsers.set(roomId, new Set());
-  }
-  onlineUsers.get(roomId)!.add(userId);
+  const onlineCount = addOnlineUser(roomId, userId);
+
+  const muted = isUserMuted(roomId, userId);
 
   success(res, {
     session_id: sessionId,
     room_id: roomId,
-    online_count: onlineUsers.get(roomId)!.size,
+    online_count: onlineCount,
+    muted,
   }, '进入直播间成功');
 });
 
@@ -83,31 +66,26 @@ router.post('/:roomId/leave', authMiddleware, (req: Request, res: Response) => {
       .run(now, duration, session_id);
   }
 
-  if (onlineUsers.has(roomId)) {
-    onlineUsers.get(roomId)!.delete(userId);
-  }
+  const onlineCount = removeOnlineUser(roomId, userId);
 
-  success(res, { duration: session ? Math.floor((now - session.join_time) / 1000) : 0 }, '已离开直播间');
+  success(res, { duration: session ? Math.floor((now - session.join_time) / 1000) : 0, online_count: onlineCount }, '已离开直播间');
 });
 
 router.post('/:roomId/heartbeat', authMiddleware, (req: Request, res: Response) => {
   const { roomId } = req.params;
   const { userId } = (req as any).user;
 
-  if (!onlineUsers.has(roomId)) {
-    onlineUsers.set(roomId, new Set());
-  }
-  onlineUsers.get(roomId)!.add(userId);
+  const onlineCount = addOnlineUser(roomId, userId);
 
   success(res, {
-    online_count: onlineUsers.get(roomId)!.size,
+    online_count: onlineCount,
     timestamp: Date.now(),
   });
 });
 
 router.get('/:roomId/online', authMiddleware, (req: Request, res: Response) => {
   const { roomId } = req.params;
-  const count = onlineUsers.get(roomId)?.size || 0;
+  const count = getOnlineCount(roomId);
   success(res, {
     room_id: roomId,
     online_count: count,
@@ -190,4 +168,4 @@ function formatDuration(seconds: number): string {
 }
 
 export default router;
-export { onlineUsers };
+export { onlineUsersCache as onlineUsers };

@@ -319,33 +319,71 @@ router.get('/:roomId/summary', authMiddleware, teacherMiddleware, (req: Request,
     return error(res, '直播间不存在', 404);
   }
 
+  const roomData = room as any;
+
   const messageCount = db.prepare('SELECT COUNT(*) as count FROM chat_messages WHERE room_id = ?').get(roomId) as { count: number };
+  const blockedMessageCount = db.prepare('SELECT COUNT(*) as count FROM chat_messages WHERE room_id = ? AND blocked = 1').get(roomId) as { count: number };
   const questionCount = db.prepare('SELECT COUNT(*) as count FROM chat_messages WHERE room_id = ? AND is_question = 1').get(roomId) as { count: number };
   const answeredCount = db.prepare('SELECT COUNT(*) as count FROM chat_messages WHERE room_id = ? AND is_question = 1 AND answer IS NOT NULL').get(roomId) as { count: number };
-  const likeRow = db.prepare('SELECT SUM(count) as total FROM likes WHERE room_id = ?').get(roomId) as { total: number };
-  const rewardRow = db.prepare('SELECT SUM(amount) as total, COUNT(*) as count FROM rewards WHERE room_id = ?').get(roomId) as { total: number; count: number };
+  const likeRow = db.prepare('SELECT SUM(count) as total, COUNT(DISTINCT user_id) as users FROM likes WHERE room_id = ?').get(roomId) as { total: number; users: number };
+  const rewardRow = db.prepare('SELECT SUM(amount) as total, COUNT(*) as count, COUNT(DISTINCT user_id) as users FROM rewards WHERE room_id = ?').get(roomId) as { total: number; count: number; users: number };
   const enrollmentRow = db.prepare('SELECT COUNT(*) as count FROM room_enrollments WHERE room_id = ?').get(roomId) as { count: number };
   const viewerRow = db.prepare('SELECT COUNT(DISTINCT user_id) as count FROM watch_sessions WHERE room_id = ?').get(roomId) as { count: number };
-  const durationRow = db.prepare('SELECT SUM(duration) as total FROM watch_sessions WHERE room_id = ?').get(roomId) as { total: number };
+  const durationRow = db.prepare('SELECT SUM(duration) as total, COUNT(*) as sessions FROM watch_sessions WHERE room_id = ?').get(roomId) as { total: number; sessions: number };
+  const muteRow = db.prepare('SELECT COUNT(DISTINCT user_id) as count FROM mutes WHERE room_id = ?').get(roomId) as { count: number };
+
+  const enrollmentCount = enrollmentRow.count;
+  const actualViewerCount = viewerRow.count;
+  const totalWatchSeconds = durationRow.total || 0;
+  const avgWatchSeconds = actualViewerCount > 0 ? Math.floor(totalWatchSeconds / actualViewerCount) : 0;
+  const attendanceRate = enrollmentCount > 0 ? Math.round((actualViewerCount / enrollmentCount) * 10000) / 100 : 0;
+  const totalInteractions = messageCount.count + (likeRow.total || 0) + rewardRow.count;
+  const answerRate = questionCount.count > 0 ? Math.round((answeredCount.count / questionCount.count) * 10000) / 100 : 0;
+
+  const replay = db.prepare('SELECT * FROM replays WHERE room_id = ?').get(roomId);
 
   success(res, {
     room_id: roomId,
-    title: (room as any).title,
-    start_time: (room as any).start_time,
-    end_time: (room as any).end_time,
-    status: (room as any).status,
+    title: roomData.title,
+    cover_image: roomData.cover_image,
+    start_time: roomData.start_time,
+    end_time: roomData.end_time,
+    status: roomData.status,
+    teacher_id: roomData.teacher_id,
+    has_replay: !!replay,
     stats: {
-      enrollments: enrollmentRow.count,
-      unique_viewers: viewerRow.count,
+      enrollments: enrollmentCount,
+      actual_viewers: actualViewerCount,
+      attendance_rate: attendanceRate,
+      total_watch_seconds: totalWatchSeconds,
+      avg_watch_seconds: avgWatchSeconds,
+      avg_watch_formatted: formatDuration(avgWatchSeconds),
       total_messages: messageCount.count,
+      blocked_messages: blockedMessageCount.count,
       questions: questionCount.count,
       answered_questions: answeredCount.count,
+      answer_rate: answerRate,
       total_likes: likeRow.total || 0,
+      like_users: likeRow.users || 0,
       total_rewards: rewardRow.total || 0,
       reward_count: rewardRow.count,
-      total_watch_seconds: durationRow.total || 0,
+      reward_users: rewardRow.users || 0,
+      total_interactions: totalInteractions,
+      muted_users: muteRow.count,
+      watch_sessions: durationRow.sessions || 0,
     },
   });
 });
+
+function formatDuration(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  const parts = [];
+  if (h > 0) parts.push(`${h}小时`);
+  if (m > 0) parts.push(`${m}分`);
+  parts.push(`${s}秒`);
+  return parts.join('');
+}
 
 export default router;

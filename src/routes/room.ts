@@ -94,34 +94,45 @@ router.get('/schedule', (req: Request, res: Response) => {
 
   const totalRow = db.prepare(`SELECT COUNT(*) as count FROM live_rooms WHERE ${where}`).get(...params) as { count: number };
   const rows = db.prepare(`
-    SELECT lr.*, u.nickname as teacher_name, u.avatar as teacher_avatar
+    SELECT lr.*, u.nickname as teacher_name, u.avatar as teacher_avatar,
+      r.id as replay_id, r.duration as replay_duration
     FROM live_rooms lr
     LEFT JOIN users u ON lr.teacher_id = u.id
+    LEFT JOIN replays r ON lr.id = r.room_id
     WHERE ${where}
     ORDER BY lr.start_time DESC
     LIMIT ? OFFSET ?
-  `).get(...params, pageSize, offset);
+  `).all(...params, pageSize, offset);
+
+  const list = Array.isArray(rows) ? rows : [];
 
   success(res, {
-    list: rows,
+    list,
     total: totalRow.count,
     page: pageNum,
     page_size: pageSize,
-  });
+    has_more: pageNum * pageSize < totalRow.count,
+    empty: totalRow.count === 0,
+  }, totalRow.count === 0 ? '暂无排课数据' : 'success');
 });
 
 router.get('/:id', (req: Request, res: Response) => {
   const { id } = req.params;
   const room = db.prepare(`
-    SELECT lr.*, u.nickname as teacher_name, u.avatar as teacher_avatar
+    SELECT lr.*, u.nickname as teacher_name, u.avatar as teacher_avatar,
+      r.id as replay_id, r.video_url as replay_url, r.duration as replay_duration,
+      r.view_count as replay_view_count, r.created_at as replay_created_at
     FROM live_rooms lr
     LEFT JOIN users u ON lr.teacher_id = u.id
+    LEFT JOIN replays r ON lr.id = r.room_id
     WHERE lr.id = ?
   `).get(id);
   if (!room) {
     return error(res, '直播间不存在', 404);
   }
-  success(res, room);
+  const roomData = room as any;
+  const hasReplay = !!roomData.replay_id;
+  success(res, { ...roomData, has_replay: hasReplay });
 });
 
 router.put('/:id', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {

@@ -3,7 +3,14 @@ import { v4 as uuidv4 } from 'uuid';
 import db from './database';
 import { verifyToken } from './utils/jwt';
 import { containsBannedWord, maskContent } from './utils/contentFilter';
-import { onlineUsers } from './routes/viewer';
+import {
+  checkRoomAccess,
+  addOnlineUser,
+  removeOnlineUser,
+  getOnlineCount,
+  isUserMuted,
+  getMuteInfo,
+} from './services/roomAccess';
 
 const roomSockets: Map<string, Set<string>> = new Map();
 
@@ -25,10 +32,13 @@ export function setupSocketIO(io: Server) {
     const user = (socket as any).user;
     console.log(`用户连接: ${user.userId}`);
 
-    socket.on('join_room', async ({ roomId }: { roomId: string }) => {
-      const room = db.prepare('SELECT * FROM live_rooms WHERE id = ?').get(roomId);
-      if (!room) {
-        socket.emit('error', { message: '直播间不存在' });
+    socket.on('join_room', async ({ roomId, watchToken }: { roomId: string; watchToken?: string }) => {
+      const accessResult = checkRoomAccess(roomId, user.userId, user.role, watchToken);
+      if (!accessResult.allowed) {
+        socket.emit('join_denied', {
+          message: accessResult.reason || '无法进入直播间',
+          code: accessResult.code || 400,
+        });
         return;
       }
 
@@ -39,15 +49,12 @@ export function setupSocketIO(io: Server) {
       }
       roomSockets.get(roomId)!.add(socket.id);
 
-      if (!onlineUsers.has(roomId)) {
-        onlineUsers.set(roomId, new Set());
-      }
-      onlineUsers.get(roomId)!.add(user.userId);
+      const onlineCount = addOnlineUser(roomId, user.userId);
 
       io.to(roomId).emit('user_joined', {
         user_id: user.userId,
         username: user.username,
-        online_count: onlineUsers.get(roomId)!.size,
+        online_count: onlineCount,
       });
 
       const dbUser = db.prepare('SELECT nickname, avatar FROM users WHERE id = ?').get(user.userId) as { nickname?: string };
@@ -61,9 +68,15 @@ export function setupSocketIO(io: Server) {
           .run(uuidv4(), roomId, user.userId, now);
       }
 
+      const muted = isUserMuted(roomId, user.userId);
+      const muteInfo = getMuteInfo(roomId, user.userId);
+
       socket.emit('joined_room', {
         roomId,
-        online_count: onlineUsers.get(roomId)!.size,
+        online_count: onlineCount,
+        muted,
+        mute_info: muteInfo,
+        room: accessResult.room,
       });
     });
 
@@ -76,6 +89,19 @@ export function setupSocketIO(io: Server) {
       if (!content || content.length > 500) {
         socket.emit('error', { message: '消息内容无效' });
         return;
+      }
+
+      if (user.role !== 'teacher' && user.role !== 'admin') {
+        const muted = isUserMuted(roomId, user.userId);
+        if (muted) {
+          const muteInfo = getMuteInfo(roomId, user.userId);
+          socket.emit('muted', {
+            message: '您已被禁言，无法发送消息',
+            mute_until: muteInfo?.mute_until,
+            reason: muteInfo?.reason,
+          });
+          return;
+        }
       }
 
       const banned = containsBannedWord(content);
@@ -217,11 +243,9 @@ export function setupSocketIO(io: Server) {
     });
 
     socket.on('heartbeat', ({ roomId }: { roomId: string }) => {
-      if (onlineUsers.has(roomId)) {
-        onlineUsers.get(roomId)!.add(user.userId);
-      }
+      const onlineCount = addOnlineUser(roomId, user.userId);
       socket.emit('heartbeat_ack', {
-        online_count: onlineUsers.get(roomId)?.size || 0,
+        online_count: onlineCount,
         timestamp: Date.now(),
       });
     });
@@ -255,14 +279,14 @@ export function setupSocketIO(io: Server) {
         }
       }
 
-      if (!hasOtherSockets && onlineUsers.has(roomId)) {
-        onlineUsers.get(roomId)!.delete(user.userId);
+      if (!hasOtherSockets) {
+        removeOnlineUser(roomId, user.userId);
       }
 
       io.to(roomId).emit('user_left', {
         user_id: user.userId,
         username: user.username,
-        online_count: onlineUsers.get(roomId)?.size || 0,
+        online_count: getOnlineCount(roomId),
       });
     });
 
@@ -280,8 +304,8 @@ export function setupSocketIO(io: Server) {
             }
           }
 
-          if (!hasOtherSockets && onlineUsers.has(roomId)) {
-            onlineUsers.get(roomId)!.delete(user.userId);
+          if (!hasOtherSockets) {
+            removeOnlineUser(roomId, user.userId);
           }
 
           const now = Date.now();
@@ -298,7 +322,7 @@ export function setupSocketIO(io: Server) {
           io.to(roomId).emit('user_left', {
             user_id: user.userId,
             username: user.username,
-            online_count: onlineUsers.get(roomId)?.size || 0,
+            online_count: getOnlineCount(roomId),
           });
         }
       }

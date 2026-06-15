@@ -91,12 +91,16 @@ router.get('/', authMiddleware, (req: Request, res: Response) => {
     LIMIT ? OFFSET ?
   `).all(...params, pageSize, offset);
 
+  const list = Array.isArray(rows) ? rows : [];
+
   success(res, {
-    list: rows,
+    list,
     total: totalRow.count,
     page: pageNum,
     page_size: pageSize,
-  });
+    has_more: pageNum * pageSize < totalRow.count,
+    empty: totalRow.count === 0,
+  }, totalRow.count === 0 ? '暂无回放数据' : 'success');
 });
 
 router.get('/:id', authMiddleware, (req: Request, res: Response) => {

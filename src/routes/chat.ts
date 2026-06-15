@@ -6,6 +6,7 @@ import { success, error } from '../utils/response';
 import { authMiddleware, teacherMiddleware } from '../middleware/auth';
 import { containsBannedWord, maskContent } from '../utils/contentFilter';
 import { ChatMessage } from '../types';
+import { isUserMuted, getMuteInfo } from '../services/roomAccess';
 
 const router = Router();
 
@@ -28,6 +29,14 @@ router.post('/:roomId/messages', authMiddleware, (req: Request, res: Response) =
   const room = db.prepare('SELECT * FROM live_rooms WHERE id = ?').get(roomId);
   if (!room) {
     return error(res, '直播间不存在', 404);
+  }
+
+  if (role !== 'teacher' && role !== 'admin') {
+    const muted = isUserMuted(roomId, userId);
+    if (muted) {
+      const muteInfo = getMuteInfo(roomId, userId);
+      return error(res, '您已被禁言，无法发送消息', 403);
+    }
   }
 
   const banned = containsBannedWord(content);

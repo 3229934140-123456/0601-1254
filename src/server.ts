@@ -13,6 +13,7 @@ import chatRoutes from './routes/chat';
 import interactionRoutes from './routes/interaction';
 import replayRoutes from './routes/replay';
 import exportRoutes from './routes/export';
+import moderationRoutes from './routes/moderation';
 import { setupSocketIO } from './socket';
 
 const app = express();
@@ -29,6 +30,11 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+app.use((req, _res, next) => {
+  (req as any).io = io;
+  next();
+});
+
 const uploadDir = path.join(process.cwd(), process.env.UPLOAD_DIR || 'uploads');
 app.use('/uploads', express.static(uploadDir));
 
@@ -43,6 +49,7 @@ app.use('/api/chat', chatRoutes);
 app.use('/api/interaction', interactionRoutes);
 app.use('/api/replays', replayRoutes);
 app.use('/api/export', exportRoutes);
+app.use('/api/moderation', moderationRoutes);
 
 app.use((_req, res) => {
   res.status(404).json({ code: 404, message: '接口不存在' });
