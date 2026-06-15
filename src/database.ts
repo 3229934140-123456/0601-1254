@@ -166,6 +166,7 @@ db.exec(`
     file_size INTEGER DEFAULT 0,
     error TEXT,
     created_by TEXT NOT NULL,
+    created_by_role TEXT NOT NULL DEFAULT 'viewer',
     created_at INTEGER NOT NULL,
     started_at INTEGER,
     completed_at INTEGER,
@@ -218,6 +219,27 @@ if (!columnExists('chat_messages', 'handled_at')) {
 }
 if (!columnExists('chat_messages', 'handled_by')) {
   db.prepare('ALTER TABLE chat_messages ADD COLUMN handled_by TEXT').run();
+}
+if (!columnExists('chat_messages', 'review_status')) {
+  db.prepare("ALTER TABLE chat_messages ADD COLUMN review_status TEXT DEFAULT 'pending'").run();
+}
+if (!columnExists('chat_messages', 'review_conclusion')) {
+  db.prepare('ALTER TABLE chat_messages ADD COLUMN review_conclusion TEXT').run();
+}
+if (!columnExists('chat_messages', 'current_handler')) {
+  db.prepare('ALTER TABLE chat_messages ADD COLUMN current_handler TEXT').run();
+}
+if (!columnExists('chat_messages', 'reviewed_at')) {
+  db.prepare('ALTER TABLE chat_messages ADD COLUMN reviewed_at INTEGER').run();
+}
+if (!columnExists('chat_messages', 'reviewed_by')) {
+  db.prepare('ALTER TABLE chat_messages ADD COLUMN reviewed_by TEXT').run();
+}
+
+db.prepare(`UPDATE chat_messages SET review_status = 'handled' WHERE handled = 1 AND blocked = 1 AND review_status = 'pending'`).run();
+
+if (!columnExists('export_tasks', 'created_by_role')) {
+  db.prepare('ALTER TABLE export_tasks ADD COLUMN created_by_role TEXT NOT NULL DEFAULT \'viewer\'').run();
 }
 
 export default db;

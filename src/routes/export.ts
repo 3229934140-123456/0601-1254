@@ -14,7 +14,10 @@ if (!fs.existsSync(exportDir)) {
   fs.mkdirSync(exportDir, { recursive: true });
 }
 
-router.get('/:roomId/chat-messages', authMiddleware, teacherMiddleware, async (req: Request, res: Response) => {
+const RESERVED_PATHS = new Set(['report', 'tasks']);
+
+router.get('/:roomId/chat-messages', authMiddleware, teacherMiddleware, async (req: Request, res: Response, next: Function) => {
+  if (RESERVED_PATHS.has(req.params.roomId)) return next();
   const { roomId } = req.params;
   const { format = 'json' } = req.query;
 
@@ -92,7 +95,8 @@ router.get('/:roomId/chat-messages', authMiddleware, teacherMiddleware, async (r
   });
 });
 
-router.get('/:roomId/questions', authMiddleware, teacherMiddleware, async (req: Request, res: Response) => {
+router.get('/:roomId/questions', authMiddleware, teacherMiddleware, async (req: Request, res: Response, next: Function) => {
+  if (RESERVED_PATHS.has(req.params.roomId)) return next();
   const { roomId } = req.params;
   const { format = 'json' } = req.query;
 
@@ -158,7 +162,8 @@ router.get('/:roomId/questions', authMiddleware, teacherMiddleware, async (req: 
   });
 });
 
-router.get('/:roomId/viewers', authMiddleware, teacherMiddleware, async (req: Request, res: Response) => {
+router.get('/:roomId/viewers', authMiddleware, teacherMiddleware, async (req: Request, res: Response, next: Function) => {
+  if (RESERVED_PATHS.has(req.params.roomId)) return next();
   const { roomId } = req.params;
   const { format = 'json' } = req.query;
 
@@ -244,7 +249,8 @@ router.get('/:roomId/viewers', authMiddleware, teacherMiddleware, async (req: Re
   });
 });
 
-router.get('/:roomId/rewards', authMiddleware, teacherMiddleware, async (req: Request, res: Response) => {
+router.get('/:roomId/rewards', authMiddleware, teacherMiddleware, async (req: Request, res: Response, next: Function) => {
+  if (RESERVED_PATHS.has(req.params.roomId)) return next();
   const { roomId } = req.params;
   const { format = 'json' } = req.query;
 
@@ -311,7 +317,8 @@ router.get('/:roomId/rewards', authMiddleware, teacherMiddleware, async (req: Re
   });
 });
 
-router.get('/:roomId/summary', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+router.get('/:roomId/summary', authMiddleware, teacherMiddleware, (req: Request, res: Response, next: Function) => {
+  if (RESERVED_PATHS.has(req.params.roomId)) return next();
   const { roomId } = req.params;
 
   const room = db.prepare('SELECT * FROM live_rooms WHERE id = ?').get(roomId);
@@ -406,7 +413,8 @@ function getTimeBuckets(startTime: number, endTime: number, granularity: string)
   return buckets;
 }
 
-router.get('/:roomId/trends', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+router.get('/:roomId/trends', authMiddleware, teacherMiddleware, (req: Request, res: Response, next: Function) => {
+  if (RESERVED_PATHS.has(req.params.roomId)) return next();
   const { roomId } = req.params;
   const { granularity = '5min', start_time, end_time } = req.query;
 
@@ -1005,13 +1013,355 @@ router.get('/report/teachers/:teacherId/courses', authMiddleware, teacherMiddlew
   }, totalRow.count === 0 ? '该讲师暂无课程数据' : 'success');
 });
 
+router.get('/report/teachers/:teacherId/profile', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { teacherId } = req.params;
+  const { userId: currentUserId, role } = (req as any).user;
+
+  if (role === 'teacher' && teacherId !== currentUserId) {
+    return error(res, '无权查看其他讲师的画像', 403);
+  }
+
+  const teacher = db.prepare('SELECT id, username, nickname, avatar, created_at FROM users WHERE id = ?').get(teacherId) as any;
+  if (!teacher) {
+    return error(res, '讲师不存在', 404);
+  }
+
+  const rooms = db.prepare(`
+    SELECT lr.id, lr.title, lr.start_time, lr.end_time, lr.status
+    FROM live_rooms lr WHERE lr.teacher_id = ?
+    ORDER BY lr.start_time DESC
+  `).all(teacherId) as any[];
+
+  const roomIdList = rooms.map(r => r.id);
+
+  const recentActiveRooms = rooms
+    .filter(r => r.status === 'live' || (r.end_time && r.end_time > Date.now() - 7 * 24 * 60 * 60 * 1000))
+    .slice(0, 5)
+    .map(r => {
+      const viewerRow = db.prepare('SELECT COUNT(DISTINCT user_id) as cnt FROM watch_sessions WHERE room_id = ?').get(r.id) as { cnt: number };
+      const msgRow = db.prepare('SELECT COUNT(*) as cnt FROM chat_messages WHERE room_id = ? AND blocked = 0').get(r.id) as { cnt: number };
+      return {
+        room_id: r.id,
+        title: r.title,
+        start_time: r.start_time,
+        end_time: r.end_time,
+        status: r.status,
+        viewer_count: viewerRow.cnt,
+        message_count: msgRow.cnt,
+      };
+    });
+
+  let problemPeriods: any[] = [];
+  let violationUserRanking: any[] = [];
+  let topBlockedWords: any[] = [];
+
+  if (roomIdList.length > 0) {
+    const placeholders = roomIdList.map(() => '?').join(',');
+
+    const hourRows = db.prepare(`
+      SELECT 
+        CAST((cm.created_at / 3600000) AS INTEGER) % 24 as hour_of_day,
+        COUNT(*) as blocked_count
+      FROM chat_messages cm
+      WHERE cm.room_id IN (${placeholders}) AND cm.blocked = 1
+      GROUP BY hour_of_day
+      ORDER BY blocked_count DESC
+    `).all(...roomIdList) as any[];
+    problemPeriods = hourRows.slice(0, 5).map(h => ({
+      hour: h.hour_of_day,
+      label: `${h.hour_of_day}:00-${h.hour_of_day + 1}:00`,
+      blocked_count: h.blocked_count,
+    }));
+
+    const violUsers = db.prepare(`
+      SELECT 
+        cm.user_id,
+        u.username,
+        u.nickname,
+        COUNT(*) as blocked_count,
+        MAX(cm.created_at) as last_blocked_at
+      FROM chat_messages cm
+      LEFT JOIN users u ON cm.user_id = u.id
+      WHERE cm.room_id IN (${placeholders}) AND cm.blocked = 1
+      GROUP BY cm.user_id
+      ORDER BY blocked_count DESC
+      LIMIT 10
+    `).all(...roomIdList) as any[];
+    violationUserRanking = violUsers;
+
+    const blockedWords = db.prepare(`
+      SELECT cm.blocked_reason, COUNT(*) as hit_count
+      FROM chat_messages cm
+      WHERE cm.room_id IN (${placeholders}) AND cm.blocked = 1 AND cm.blocked_reason IS NOT NULL
+      GROUP BY cm.blocked_reason
+      ORDER BY hit_count DESC
+      LIMIT 10
+    `).all(...roomIdList) as any[];
+    topBlockedWords = blockedWords;
+  }
+
+  const totalCourses = rooms.length;
+  const liveCourses = rooms.filter(r => r.status === 'live').length;
+  const endedCourses = rooms.filter(r => r.status === 'ended').length;
+
+  let totalEnrollments = 0;
+  let totalViewers = 0;
+  let totalBlocked = 0;
+  let totalMuted = 0;
+
+  if (roomIdList.length > 0) {
+    const placeholders = roomIdList.map(() => '?').join(',');
+    const enrollRow = db.prepare(`SELECT COUNT(*) as cnt FROM room_enrollments WHERE room_id IN (${placeholders})`).get(...roomIdList) as { cnt: number };
+    const viewerRow = db.prepare(`SELECT COUNT(DISTINCT user_id) as cnt FROM watch_sessions WHERE room_id IN (${placeholders})`).get(...roomIdList) as { cnt: number };
+    const blockedRow = db.prepare(`SELECT COUNT(*) as cnt FROM chat_messages WHERE room_id IN (${placeholders}) AND blocked = 1`).get(...roomIdList) as { cnt: number };
+    const mutedRow = db.prepare(`SELECT COUNT(DISTINCT user_id) as cnt FROM mutes WHERE room_id IN (${placeholders})`).get(...roomIdList) as { cnt: number };
+    totalEnrollments = enrollRow.cnt;
+    totalViewers = viewerRow.cnt;
+    totalBlocked = blockedRow.cnt;
+    totalMuted = mutedRow.cnt;
+  }
+
+  success(res, {
+    teacher,
+    overview: {
+      total_courses: totalCourses,
+      live_courses: liveCourses,
+      ended_courses: endedCourses,
+      total_enrollments: totalEnrollments,
+      total_viewers: totalViewers,
+      total_blocked: totalBlocked,
+      total_muted: totalMuted,
+      risk_level: totalBlocked > 20 ? 'high' : totalBlocked > 5 ? 'medium' : 'low',
+    },
+    recent_active_courses: recentActiveRooms,
+    problem_periods: problemPeriods,
+    violation_user_ranking: violationUserRanking,
+    top_blocked_words: topBlockedWords,
+    empty: totalCourses === 0,
+  }, totalCourses === 0 ? '该讲师暂无课程数据' : 'success');
+});
+
+router.get('/report/overview', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
+  const { userId: currentUserId, role } = (req as any).user;
+  const { start_date, end_date, teacher_id, granularity = 'day' } = req.query;
+
+  if (!start_date || !end_date) {
+    return error(res, '请提供 start_date 和 end_date', 400);
+  }
+
+  const startTime = Number(start_date);
+  const endTime = Number(end_date);
+
+  let roomWhere = 'lr.start_time >= ? AND lr.start_time <= ?';
+  const roomParams: any[] = [startTime, endTime];
+
+  if (role === 'teacher') {
+    roomWhere += ' AND lr.teacher_id = ?';
+    roomParams.push(currentUserId);
+  } else if (teacher_id) {
+    roomWhere += ' AND lr.teacher_id = ?';
+    roomParams.push(teacher_id);
+  }
+
+  const rooms = db.prepare(`
+    SELECT lr.id, lr.teacher_id, lr.start_time, lr.end_time, lr.status, u.nickname as teacher_name
+    FROM live_rooms lr LEFT JOIN users u ON lr.teacher_id = u.id
+    WHERE ${roomWhere}
+    ORDER BY lr.start_time ASC
+  `).all(...roomParams) as any[];
+
+  const stepMs = granularity === 'week' ? 7 * 24 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  const stepLabel = granularity === 'week' ? 'week' : 'day';
+
+  const buckets: number[] = [];
+  let cursor = Math.floor(startTime / stepMs) * stepMs;
+  const endBucket = Math.floor(endTime / stepMs) * stepMs;
+  while (cursor <= endBucket) {
+    buckets.push(cursor);
+    cursor += stepMs;
+  }
+
+  const bucketIndex = (ts: number) => {
+    const idx = Math.floor((ts - buckets[0]) / stepMs);
+    return Math.max(0, Math.min(idx, buckets.length - 1));
+  };
+
+  const bucketData = buckets.map(b => ({
+    period_start: b,
+    period_label: granularity === 'week'
+      ? `${new Date(b).toLocaleDateString('zh-CN')} 周`
+      : new Date(b).toLocaleDateString('zh-CN'),
+    course_ids: new Set<string>(),
+    teacher_ids: new Set<string>(),
+    enrollments: 0,
+    viewer_count: 0,
+    total_watch_seconds: 0,
+    watch_user_count: 0,
+    messages: 0,
+    blocked: 0,
+    likes: 0,
+    reward_amount: 0,
+    reward_count: 0,
+    muted_users: new Set<string>(),
+  }));
+
+  const roomIdList = rooms.map(r => r.id);
+  const roomPeriodMap = new Map<string, number>();
+  for (const room of rooms) {
+    const idx = bucketIndex(room.start_time);
+    roomPeriodMap.set(room.id, idx);
+    bucketData[idx].course_ids.add(room.id);
+    bucketData[idx].teacher_ids.add(room.teacher_id);
+  }
+
+  if (roomIdList.length > 0) {
+    const placeholders = roomIdList.map(() => '?').join(',');
+
+    const enrollRows = db.prepare(`
+      SELECT room_id, COUNT(*) as cnt FROM room_enrollments WHERE room_id IN (${placeholders}) GROUP BY room_id
+    `).all(...roomIdList) as any[];
+    for (const e of enrollRows) {
+      const idx = roomPeriodMap.get(e.room_id);
+      if (idx !== undefined) bucketData[idx].enrollments += e.cnt;
+    }
+
+    const viewerRows = db.prepare(`
+      SELECT room_id, COUNT(DISTINCT user_id) as cnt FROM watch_sessions WHERE room_id IN (${placeholders}) GROUP BY room_id
+    `).all(...roomIdList) as any[];
+    for (const v of viewerRows) {
+      const idx = roomPeriodMap.get(v.room_id);
+      if (idx !== undefined) {
+        bucketData[idx].viewer_count += v.cnt;
+      }
+    }
+
+    const durRows = db.prepare(`
+      SELECT room_id, SUM(duration) as total_dur, COUNT(DISTINCT user_id) as user_cnt FROM watch_sessions WHERE room_id IN (${placeholders}) GROUP BY room_id
+    `).all(...roomIdList) as any[];
+    for (const d of durRows) {
+      const idx = roomPeriodMap.get(d.room_id);
+      if (idx !== undefined) {
+        bucketData[idx].total_watch_seconds += d.total_dur || 0;
+        bucketData[idx].watch_user_count += d.user_cnt || 0;
+      }
+    }
+
+    const msgRows = db.prepare(`
+      SELECT room_id, SUM(CASE WHEN blocked = 0 THEN 1 ELSE 0 END) as msg_cnt, SUM(CASE WHEN blocked = 1 THEN 1 ELSE 0 END) as blocked_cnt FROM chat_messages WHERE room_id IN (${placeholders}) GROUP BY room_id
+    `).all(...roomIdList) as any[];
+    for (const m of msgRows) {
+      const idx = roomPeriodMap.get(m.room_id);
+      if (idx !== undefined) {
+        bucketData[idx].messages += m.msg_cnt || 0;
+        bucketData[idx].blocked += m.blocked_cnt || 0;
+      }
+    }
+
+    const likeRows = db.prepare(`
+      SELECT room_id, SUM(count) as total_cnt FROM likes WHERE room_id IN (${placeholders}) GROUP BY room_id
+    `).all(...roomIdList) as any[];
+    for (const l of likeRows) {
+      const idx = roomPeriodMap.get(l.room_id);
+      if (idx !== undefined) bucketData[idx].likes += l.total_cnt || 0;
+    }
+
+    const rewardRows = db.prepare(`
+      SELECT room_id, SUM(amount) as total_amt, COUNT(*) as cnt FROM rewards WHERE room_id IN (${placeholders}) GROUP BY room_id
+    `).all(...roomIdList) as any[];
+    for (const r of rewardRows) {
+      const idx = roomPeriodMap.get(r.room_id);
+      if (idx !== undefined) {
+        bucketData[idx].reward_amount += r.total_amt || 0;
+        bucketData[idx].reward_count += r.cnt || 0;
+      }
+    }
+
+    const muteRows = db.prepare(`
+      SELECT room_id, GROUP_CONCAT(DISTINCT user_id) as user_ids FROM mutes WHERE room_id IN (${placeholders}) GROUP BY room_id
+    `).all(...roomIdList) as any[];
+    for (const m of muteRows) {
+      const idx = roomPeriodMap.get(m.room_id);
+      if (idx !== undefined && m.user_ids) {
+        for (const uid of m.user_ids.split(',')) {
+          bucketData[idx].muted_users.add(uid);
+        }
+      }
+    }
+  }
+
+  const timeline = bucketData
+    .filter(b => b.course_ids.size > 0)
+    .map(b => {
+      const viewerCount = b.viewer_count || b.watch_user_count;
+      const avgWatch = viewerCount > 0 ? Math.floor(b.total_watch_seconds / viewerCount) : 0;
+      const attendanceRate = b.enrollments > 0 ? Math.round((viewerCount / b.enrollments) * 10000) / 100 : 0;
+      return {
+        period: b.period_label,
+        period_start: b.period_start,
+        course_count: b.course_ids.size,
+        teacher_count: b.teacher_ids.size,
+        enrollment_count: b.enrollments,
+        viewer_count: viewerCount,
+        attendance_rate: attendanceRate,
+        avg_watch_seconds: avgWatch,
+        avg_watch_formatted: formatDuration(avgWatch),
+        message_count: b.messages,
+        blocked_count: b.blocked,
+        like_count: b.likes,
+        reward_count: b.reward_count,
+        reward_amount: b.reward_amount,
+        muted_user_count: b.muted_users.size,
+        interaction_count: b.messages + b.likes + b.reward_count,
+      };
+    });
+
+  const totalEnrollments = timeline.reduce((s, t) => s + t.enrollment_count, 0);
+  const totalViewers = timeline.reduce((s, t) => s + t.viewer_count, 0);
+  const totalMessages = timeline.reduce((s, t) => s + t.message_count, 0);
+  const totalLikes = timeline.reduce((s, t) => s + t.like_count, 0);
+  const totalRewardAmount = timeline.reduce((s, t) => s + t.reward_amount, 0);
+  const totalInteractions = timeline.reduce((s, t) => s + t.interaction_count, 0);
+  const totalBlocked = timeline.reduce((s, t) => s + t.blocked_count, 0);
+  const totalMuted = timeline.reduce((s, t) => s + t.muted_user_count, 0);
+  const avgAttendanceRate = timeline.length > 0
+    ? Math.round(timeline.reduce((s, t) => s + t.attendance_rate, 0) / timeline.length * 100) / 100
+    : 0;
+
+  success(res, {
+    granularity: stepLabel,
+    start_time: startTime,
+    end_time: endTime,
+    total_periods: timeline.length,
+    empty: timeline.length === 0,
+    summary: {
+      total_courses: rooms.length,
+      total_enrollments: totalEnrollments,
+      total_viewers: totalViewers,
+      avg_attendance_rate: avgAttendanceRate,
+      total_messages: totalMessages,
+      total_likes: totalLikes,
+      total_reward_amount: totalRewardAmount,
+      total_interactions: totalInteractions,
+      total_blocked: totalBlocked,
+      total_muted: totalMuted,
+    },
+    timeline,
+  }, timeline.length === 0 ? '暂无运营数据' : 'success');
+});
+
 const exportTaskRunners: Record<string, (params: any, filePath: string) => Promise<void>> = {};
 
 exportTaskRunners['course_report'] = async (params: any, filePath: string) => {
-  const { teacher_id, start_date, end_date, status } = params;
+  const { teacher_id, start_date, end_date, status, created_by_role, created_by_id } = params;
   let where = '1=1';
   const sqlParams: any[] = [];
-  if (teacher_id) { where += ' AND lr.teacher_id = ?'; sqlParams.push(teacher_id); }
+  if (created_by_role === 'teacher') {
+    where += ' AND lr.teacher_id = ?';
+    sqlParams.push(created_by_id);
+  } else if (teacher_id) {
+    where += ' AND lr.teacher_id = ?';
+    sqlParams.push(teacher_id);
+  }
   if (start_date) { where += ' AND lr.start_time >= ?'; sqlParams.push(Number(start_date)); }
   if (end_date) { where += ' AND lr.start_time <= ?'; sqlParams.push(Number(end_date)); }
   if (status) { where += ' AND lr.status = ?'; sqlParams.push(status); }
@@ -1077,9 +1427,15 @@ exportTaskRunners['course_report'] = async (params: any, filePath: string) => {
 };
 
 exportTaskRunners['teacher_report'] = async (params: any, filePath: string) => {
-  const { start_date, end_date } = params;
-  const teachers = db.prepare(`SELECT u.id as teacher_id, u.username, u.nickname FROM users u WHERE u.role IN ('teacher', 'admin')`)
-    .all() as any[];
+  const { start_date, end_date, created_by_role, created_by_id } = params;
+  let teacherFilter = "u.role IN ('teacher', 'admin')";
+  const teacherParams: any[] = [];
+  if (created_by_role === 'teacher') {
+    teacherFilter += ' AND u.id = ?';
+    teacherParams.push(created_by_id);
+  }
+  const teachers = db.prepare(`SELECT u.id as teacher_id, u.username, u.nickname FROM users u WHERE ${teacherFilter}`)
+    .all(...teacherParams) as any[];
 
   const csvWriter = createObjectCsvWriter({
     path: filePath,
@@ -1145,7 +1501,7 @@ function runExportTask(taskId: string) {
 }
 
 router.post('/tasks', authMiddleware, teacherMiddleware, (req: Request, res: Response) => {
-  const { userId } = (req as any).user;
+  const { userId, role } = (req as any).user;
   const { type, params } = req.body;
 
   if (!type) {
@@ -1158,10 +1514,15 @@ router.post('/tasks', authMiddleware, teacherMiddleware, (req: Request, res: Res
 
   const id = uuidv4();
   const now = Date.now();
+  const taskParams = {
+    ...(params || {}),
+    created_by_role: role,
+    created_by_id: userId,
+  };
 
-  db.prepare(`INSERT INTO export_tasks (id, type, params, status, created_by, created_at)
-    VALUES (?, ?, ?, 'pending', ?, ?)`)
-    .run(id, type, JSON.stringify(params || {}), userId, now);
+  db.prepare(`INSERT INTO export_tasks (id, type, params, status, created_by, created_by_role, created_at)
+    VALUES (?, ?, ?, 'pending', ?, ?, ?)`)
+    .run(id, type, JSON.stringify(taskParams), userId, role, now);
 
   setImmediate(() => runExportTask(id));
 
